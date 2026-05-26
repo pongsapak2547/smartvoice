@@ -309,6 +309,15 @@ def _short_evidence(value: str) -> str:
     cleaned = sanitize_evidence(text)
     return cleaned or "—"
 
+def _direction_from_filename(filename: str) -> str:
+    """Detect Inbound/Outbound from filename suffix (e.g. '...Inbound.wav')."""
+    base = (filename or "").rsplit(".", 1)[0].lower()
+    if base.endswith("inbound"):
+        return "📥 Inbound"
+    if base.endswith("outbound"):
+        return "📤 Outbound"
+    return "—"
+
 def _score_value(value) -> float:
     try:
         score = float(value)
@@ -337,6 +346,7 @@ for call in done_calls:
             "case_id": call.get("case_id"),
             "filename": call["filename"],
             "phone": call.get("customer_phone") or "",
+            "direction": _direction_from_filename(call["filename"]),
             "created_at": call.get("created_at") or "",
             "politeness": politeness,
             "problem_solving": problem_solving,
@@ -387,8 +397,19 @@ for case_id, entries in case_groups.items():
     else:
         label = f"{_phone_prefix(phone)}📂 เคส #{case_id} — {case['subject']} ({n} สาย)"
     evidence_prefix = f"เฉลี่ยจาก {n} สาย; ล่าสุด: " if n > 1 else ""
+    # Direction: if all calls share one direction, use it; else show mixed counts
+    dirs = [e["direction"] for e in entries if e["direction"] != "—"]
+    if not dirs:
+        direction_label = "—"
+    elif len(set(dirs)) == 1:
+        direction_label = dirs[0]
+    else:
+        inb = sum(1 for d in dirs if "Inbound" in d)
+        out = sum(1 for d in dirs if "Outbound" in d)
+        direction_label = f"🔀 ผสม (เข้า {inb}, ออก {out})"
     agent_rows.append({
         "Label": label,
+        "Direction": direction_label,
         "Politeness": f"{sum(e['politeness'] for e in entries) / n:.1f} / 5.0",
         "Politeness Evidence": f"{evidence_prefix}{latest['politeness_evidence']}",
         "Problem Solving": f"{sum(e['problem_solving'] for e in entries) / n:.1f} / 5.0",
@@ -402,6 +423,7 @@ for case_id, entries in case_groups.items():
 for entry in solo_calls:
     agent_rows.append({
         "Label": f"{_phone_prefix(entry['phone'])}{entry['filename']}",
+        "Direction": entry["direction"],
         "Politeness": f"{entry['politeness']:.1f} / 5.0",
         "Politeness Evidence": entry["politeness_evidence"],
         "Problem Solving": f"{entry['problem_solving']:.1f} / 5.0",
@@ -581,6 +603,7 @@ if agent_rows:
             hide_index=True,
             column_config={
                 "Label": st.column_config.TextColumn("สาย / เคส", width="large"),
+                "Direction": st.column_config.TextColumn("Direction", width="small"),
                 "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=10, format="%.1f / 10"),
                 "Politeness Evidence": st.column_config.TextColumn("หลักฐาน Politeness", width="large"),
                 "Problem Solving Evidence": st.column_config.TextColumn("หลักฐาน Problem Solving", width="large"),
