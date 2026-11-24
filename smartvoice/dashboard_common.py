@@ -259,7 +259,7 @@ def load_filtered_calls() -> tuple[pd.DataFrame, int]:
         f_col1, f_col2, f_col3, f_col4 = st.columns([1, 1, 1, 1.2])
         with f_col1:
             st.date_input(
-                "ช่วงวันที่", min_value=min_date, max_value=max_date, key=KEY_DATES,
+                "ช่วงวันที่อัปโหลด", help="เลือกวันเริ่มต้นและวันสิ้นสุดของสายที่ต้องการดู", min_value=min_date, max_value=max_date, key=KEY_DATES,
                 on_change=remember_filters,
             )
         with f_col2:

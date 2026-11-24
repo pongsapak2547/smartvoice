@@ -141,7 +141,7 @@ if can_edit:
         )
 
         upload_key = f"_so_upload_{st.session_state.get('_so_upload_n', 0)}"
-        uploaded = st.file_uploader("เลือกไฟล์ .xlsx หรือ .csv", type=["xlsx", "csv"], key=upload_key)
+        uploaded = st.file_uploader("เลือกไฟล์ .xlsx หรือ .csv", type=["xlsx", "csv"], help="เลือกไฟล์ตามแม่แบบ แล้วตรวจตัวอย่างก่อนยืนยันนำเข้า", key=upload_key)
         if uploaded is not None:
             try:
                 frame = sales_orders.read_upload(uploaded.name, uploaded.getvalue())
@@ -197,7 +197,7 @@ if can_edit:
 
     # ── เพิ่ม/แก้ไข ──────────────────────────────────────────────────────
     with tabs[2]:
-        mode = st.radio("ต้องการ", ["เพิ่ม SO ใหม่", "แก้ไข SO ที่มีอยู่"], horizontal=True, key="_so_mode")
+        mode = st.radio("วิธีบันทึกใบสั่งขาย", ["เพิ่ม SO ใหม่", "แก้ไข SO ที่มีอยู่"], horizontal=True, key="_so_mode")
         order = None
         if mode == "แก้ไข SO ที่มีอยู่":
             pick_search = st.text_input("ค้นหา SO ที่จะแก้ไข", key="_so_edit_search",
@@ -233,8 +233,12 @@ if can_edit:
 
             header = {}
             st.markdown("**ข้อมูลเอกสาร**")
+            st.caption("ต้องระบุเลขที่ SO ช่องอื่นกรอกตามใบสั่งขายหรือเว้นว่างได้")
             c1, c2, c3 = st.columns(3)
-            header["so_number"] = _text("so_number", "เลขที่ SO *", c1, disabled=bool(order))
+            header["so_number"] = _text(
+                "so_number", "เลขที่ SO *", c1, disabled=bool(order), placeholder="เช่น SO-001",
+                help="ใช้เลขที่ไม่ซ้ำ อย่างน้อย 2 ตัวอักษร ใช้ตัวอักษรอังกฤษ ตัวเลข หรือ . _ - / ได้",
+            )
             header["document_date"] = _date("document_date", "วันที่เอกสาร", c2)
             header["order_date"] = _date("order_date", "วันที่สั่งซื้อ", c3)
             c1, c2, c3 = st.columns(3)
@@ -242,30 +246,30 @@ if can_edit:
             header["promised_delivery_date"] = _date("promised_delivery_date", "วันที่สัญญาส่ง", c2)
             header["due_date"] = _date("due_date", "วันครบกำหนด", c3)
             c1, c2, c3, c4 = st.columns(4)
-            header["sales_type"] = _text("sales_type", "ประเภทการขาย", c1)
-            header["purchasing_type"] = _text("purchasing_type", "ประเภทการซื้อ", c2)
-            header["salesperson"] = _text("salesperson", "พนักงานขาย", c3)
+            header["sales_type"] = _text("sales_type", "ประเภทการขาย", c1, placeholder="เช่น ขายปลีก")
+            header["purchasing_type"] = _text("purchasing_type", "ประเภทการซื้อ", c2, placeholder="เช่น สั่งซื้อตามใบเสนอราคา")
+            header["salesperson"] = _text("salesperson", "พนักงานขาย", c3, placeholder="ชื่อหรือรหัสพนักงานขาย")
             header["currency"] = _text("currency", "สกุลเงิน", c4, placeholder="THB")
             c1, c2, c3 = st.columns(3)
-            header["external_doc"] = _text("external_doc", "เลขที่เอกสารภายนอก", c1)
-            header["credit_term"] = _text("credit_term", "เครดิต", c2)
-            header["customer_po_no"] = _text("customer_po_no", "เลขที่ PO ลูกค้า", c3)
+            header["external_doc"] = _text("external_doc", "เลขที่เอกสารภายนอก", c1, placeholder="เลขอ้างอิงจากคู่ค้า")
+            header["credit_term"] = _text("credit_term", "เงื่อนไขการชำระเงิน", c2, placeholder="เช่น เครดิต 30 วัน")
+            header["customer_po_no"] = _text("customer_po_no", "เลขที่ใบสั่งซื้อของลูกค้า (PO)", c3)
 
             buyer_col, receiver_col = st.columns(2)
             with buyer_col:
                 st.markdown("**ผู้ซื้อ (Sell-to)**")
-                header["sell_to_no"] = _text("sell_to_no", "รหัสผู้ซื้อ", st)
-                header["sell_to_name"] = _text("sell_to_name", "ชื่อผู้ซื้อ", st)
-                header["sell_to_address"] = _text("sell_to_address", "ที่อยู่ผู้ซื้อ", st)
-                header["sell_to_contact"] = _text("sell_to_contact", "ผู้ติดต่อ", st)
-                header["sell_to_phone"] = _text("sell_to_phone", "เบอร์ผู้ซื้อ", st)
+                header["sell_to_no"] = _text("sell_to_no", "รหัสผู้ซื้อ", st, placeholder="C-001")
+                header["sell_to_name"] = _text("sell_to_name", "ชื่อผู้ซื้อ", st, placeholder="ชื่อบุคคลหรือบริษัทผู้ซื้อ")
+                header["sell_to_address"] = _text("sell_to_address", "ที่อยู่ผู้ซื้อ", st, placeholder="บ้านเลขที่ ถนน จังหวัด")
+                header["sell_to_contact"] = _text("sell_to_contact", "ผู้ติดต่อ", st, placeholder="ชื่อผู้ประสานงานฝ่ายผู้ซื้อ")
+                header["sell_to_phone"] = _text("sell_to_phone", "เบอร์ผู้ซื้อ", st, placeholder="0812345678")
             with receiver_col:
                 st.markdown("**ผู้รับ / ที่อยู่จัดส่ง (Ship-to)**")
-                header["ship_to_name"] = _text("ship_to_name", "ชื่อผู้รับ", st)
-                header["ship_to_address"] = _text("ship_to_address", "ที่อยู่ผู้รับ", st)
-                header["ship_to_contact"] = _text("ship_to_contact", "ผู้ติดต่อ", st)
-                header["ship_to_phone"] = _text("ship_to_phone", "เบอร์ผู้รับ", st)
-                header["ship_to_email"] = _text("ship_to_email", "อีเมลผู้รับ", st)
+                header["ship_to_name"] = _text("ship_to_name", "ชื่อผู้รับ", st, placeholder="ชื่อผู้รับตามใบจัดส่ง")
+                header["ship_to_address"] = _text("ship_to_address", "ที่อยู่ผู้รับ", st, placeholder="ที่อยู่สำหรับจัดส่งสินค้า")
+                header["ship_to_contact"] = _text("ship_to_contact", "ผู้ติดต่อ", st, placeholder="ชื่อผู้ประสานงานที่จุดส่งสินค้า")
+                header["ship_to_phone"] = _text("ship_to_phone", "เบอร์ผู้รับ", st, placeholder="0812345678")
+                header["ship_to_email"] = _text("ship_to_email", "อีเมลผู้รับ", st, placeholder="receiver@example.com")
 
             st.markdown("**รายการสินค้า** — เพิ่มแถวได้ที่ปุ่ม + ใต้ตาราง, ช่องจำนวนเงินที่ว่างระบบคำนวณให้")
             line_frame = pd.DataFrame(
@@ -298,12 +302,12 @@ if can_edit:
                     "item_no": st.column_config.TextColumn("รหัสสินค้า/บาร์โค้ด"),
                     "description": st.column_config.TextColumn("รายละเอียดสินค้า", width="large"),
                     "requested_delivery_date": st.column_config.DateColumn("วันที่ต้องการรับ", format="DD/MM/YYYY"),
-                    "uom": st.column_config.TextColumn("หน่วย"),
-                    "location": st.column_config.TextColumn("คลัง"),
+                    "uom": st.column_config.TextColumn("หน่วย", help="เช่น ชิ้น หรือชุด"),
+                    "location": st.column_config.TextColumn("คลังสินค้า"),
                     "quantity": st.column_config.NumberColumn("จำนวน"),
                     "unit_price": st.column_config.NumberColumn("ราคาต่อหน่วย", format="%.2f"),
-                    "discount": st.column_config.NumberColumn("ส่วนลด", format="%.2f"),
-                    "amount": st.column_config.NumberColumn("จำนวนเงิน", format="%.2f"),
+                    "discount": st.column_config.NumberColumn("ส่วนลด", format="%.2f", help=sales_orders.FIELDS_BY_KEY["line_discount"].note),
+                    "amount": st.column_config.NumberColumn("จำนวนเงิน", format="%.2f", help=sales_orders.FIELDS_BY_KEY["amount"].note),
                 },
             )
 
@@ -316,15 +320,15 @@ if can_edit:
             if auto_totals:
                 c1, c2 = st.columns(2)
                 header["discount"] = _money("discount", "ส่วนลดท้ายบิล", c1)
-                header["vat"] = _money("vat", "VAT", c2)
+                header["vat"] = _money("vat", "ภาษีมูลค่าเพิ่ม (จำนวนเงิน)", c2)
             else:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 header["total"] = _money("total", "ยอดรวม", c1)
                 header["discount"] = _money("discount", "ส่วนลดท้ายบิล", c2)
                 header["net_amount"] = _money("net_amount", "ยอดหลังหักส่วนลด", c3)
-                header["vat"] = _money("vat", "VAT", c4)
+                header["vat"] = _money("vat", "ภาษีมูลค่าเพิ่ม (จำนวนเงิน)", c4)
                 header["grand_total"] = _money("grand_total", "ยอดรวมสุทธิ", c5)
-            header["remark"] = st.text_area("หมายเหตุ", value=values.get("remark") or "", key=f"_so_remark_{sid}")
+            header["remark"] = st.text_area("หมายเหตุ", placeholder="เช่น ข้อกำหนดในการจัดส่ง", value=values.get("remark") or "", key=f"_so_remark_{sid}")
 
             customers = db.get_all_customers()
             options = [None] + [c["id"] for c in customers]

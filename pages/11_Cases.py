@@ -152,17 +152,20 @@ if case_counts["total"] > 0:
             "สถานะเคส",
             list(_STATUS_OPTIONS.keys()),
             key="case_status_filter",
+            help="เลือกสถานะเพื่อกรองรายการ หรือเลือกทั้งหมดเพื่อดูทุกสถานะ",
         )
     with cf_owner_col:
         cs_owner_label = st.selectbox(
             "ผู้รับเคส",
             _OWNER_OPTIONS,
             key="case_owner_filter",
+            help="เลือก ‘ยังไม่มีคนรับ’ เพื่อหาเคสว่าง หรือ ‘เคสของฉัน’ เพื่อดูงานที่รับไว้",
         )
     with cf_search_col:
         cs_search = st.text_input(
             "ค้นหา (หัวข้อ / ชื่อลูกค้า / เบอร์ / ผู้รับเคส)",
             key="case_search",
+            help="พิมพ์คำค้นบางส่วน หรือล้างช่องนี้เพื่อดูทุกเคสตามตัวกรอง",
             placeholder="เช่น แจ้งปัญหา, สุภาพร, 0819999336",
         )
     with cf_size_col:

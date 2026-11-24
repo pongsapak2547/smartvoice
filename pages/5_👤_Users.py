@@ -61,7 +61,20 @@ st.divider()
 # ── Add a new account ────────────────────────────────────────────────────
 st.subheader("เพิ่มผู้ใช้ใหม่")
 
+new_role = st.selectbox(
+    "บทบาทของผู้ใช้ใหม่",
+    ROLES,
+    index=ROLES.index("Agent"),
+    format_func=lambda r: f"{r} ({ROLE_LABELS_TH[r]})",
+    key="_add_user_role",
+)
+st.markdown(
+    "**สิทธิ์ของบทบาทที่เลือก**\n\n"
+    + "\n".join(f"- {PAGE_LABELS_TH[page]}" for page in visible_pages(new_role))
+)
+
 with st.form("_add_user_form"):
+    st.caption("กรอกชื่อผู้ใช้และรหัสผ่านทั้งสองช่อง หากเว้นชื่อที่แสดง ระบบจะใช้ชื่อผู้ใช้แทน")
     c1, c2 = st.columns(2)
     with c1:
         new_username = st.text_input(
@@ -70,19 +83,9 @@ with st.form("_add_user_form"):
         )
         new_display = st.text_input("ชื่อที่แสดง", placeholder="เช่น สมชาย ประเสริฐ")
     with c2:
-        new_role = st.selectbox(
-            "บทบาท",
-            ROLES,
-            index=ROLES.index("Agent"),
-            format_func=lambda r: f"{r} ({ROLE_LABELS_TH[r]})",
-        )
         new_password = st.text_input("รหัสผ่านเริ่มต้น", type="password", help="อย่างน้อย 8 ตัวอักษร — แจ้งพนักงานให้เปลี่ยนเองหลังเข้าใช้ครั้งแรก")
-        new_confirm = st.text_input("ยืนยันรหัสผ่าน", type="password")
+        new_confirm = st.text_input("ยืนยันรหัสผ่าน", type="password", help="พิมพ์รหัสผ่านเริ่มต้นอีกครั้งให้ตรงกัน")
 
-    st.caption(
-        "สิทธิ์ของบทบาทที่เลือก: "
-        + " · ".join(PAGE_LABELS_TH[page] for page in visible_pages(new_role))
-    )
     add_submitted = st.form_submit_button("สร้างบัญชี")
 
 if add_submitted:
@@ -133,18 +136,20 @@ with edit_col:
     # value from the previously selected account and ignores `value=`, so
     # switching accounts would save the wrong display name / role.
     edit_display = st.text_input(
-        "ชื่อที่แสดง", value=selected["display_name"], key=f"_edit_display_{selected['id']}"
+        "ชื่อที่แสดง", help="ชื่อพนักงานที่ใช้แสดงในระบบ", value=selected["display_name"], key=f"_edit_display_{selected['id']}"
     )
     edit_role = st.selectbox(
         "บทบาท",
         ROLES,
         index=ROLES.index(normalize_role(selected["role"])),
         format_func=lambda r: f"{r} ({ROLE_LABELS_TH[r]})",
+        help="เลือกบทบาทเพื่อกำหนดหน้าที่บัญชีนี้เปิดได้",
         key=f"_edit_role_{selected['id']}",
     )
     edit_active = st.toggle(
         "เปิดใช้งานบัญชี",
         value=bool(selected["is_active"]),
+        help="ปิดสวิตช์เพื่อระงับการเข้าใช้งานของบัญชีนี้",
         key=f"_edit_active_{selected['id']}",
     )
     if is_self:

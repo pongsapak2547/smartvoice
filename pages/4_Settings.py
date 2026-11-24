@@ -74,6 +74,7 @@ st.subheader("ตั้งค่าโดยละเอียด")
 demo_mode = st.toggle(
     "โหมดสาธิต (ไม่ถอดเสียงจริง ใช้บทสนทนาตัวอย่าง)",
     value=env_bool(values, "MOCK_STT", default=False),
+    help="เปิดเพื่อใช้บทสนทนาตัวอย่าง การวิเคราะห์ข้อความยังต้องใช้คีย์ Typhoon",
 )
 
 st.markdown("#### AI สำหรับการใช้งานจริง")
@@ -91,6 +92,7 @@ if stt_provider == "pyannote_api":
         "รุ่น Pyannote API", ["precision-2", "precision-3"],
         index=1 if values.get("PYANNOTE_API_MODEL") == "precision-3" else 0,
         key="_pyannote_api_model",
+        help="เลือกรุ่นที่บัญชี pyannoteAI ใช้แยกผู้พูดในไฟล์เสียง",
     )
 if llm_provider == "typhoon":
     api_updates["TYPHOON_MODEL"] = st.text_input(
@@ -101,7 +103,10 @@ if llm_provider == "typhoon":
 for field, enabled in (("PYANNOTE_API_KEY", stt_provider == "pyannote_api"), ("TYPHOON_API_KEY", llm_provider == "typhoon")):
     if enabled:
         st.caption(f"{field}: {'ตั้งค่าไว้แล้ว' if values.get(field) else 'ยังไม่ได้ตั้งค่า'}")
-        secret = st.text_input(field, type="password", placeholder="เว้นว่างเพื่อใช้ค่าเดิม", key=f"_api_secret_{field}")
+        secret = st.text_input(
+            field, type="password", help="กรอกคีย์ของบริการนี้เมื่อต้องการเปลี่ยนค่า",
+            placeholder="เว้นว่างเพื่อใช้ค่าเดิม", key=f"_api_secret_{field}",
+        )
         clear = st.checkbox(f"ลบ {field} ที่บันทึกไว้", key=f"_api_clear_{field}")
         if clear:
             api_updates[field] = ""

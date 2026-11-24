@@ -123,6 +123,7 @@ uploaded_files = st.file_uploader(
     "ลากไฟล์ .wav หรือ .mp3 มาวางที่นี่",
     type=["wav", "mp3"],
     accept_multiple_files=True,
+    help=f"เลือกไฟล์เสียงได้หลายไฟล์ ขนาดไม่เกิน {file_manager.MAX_FILE_SIZE_MB} MB ต่อไฟล์",
 )
 
 if uploaded_files:
@@ -510,7 +511,6 @@ else:
             "ค้นหา",
             key="_call_search",
             placeholder="ชื่อไฟล์ / เบอร์ / ผู้อัพโหลด",
-            label_visibility="collapsed",
         ).strip().lower()
     with tbar_status:
         status_filter = st.radio(
@@ -518,14 +518,12 @@ else:
             ["ทั้งหมด", "รอประมวลผล", "กำลังประมวลผล", "เสร็จแล้ว", "ผิดพลาด"],
             horizontal=True,
             key="_call_status_filter",
-            label_visibility="collapsed",
         )
     with tbar_sort:
         sort_mode = st.selectbox(
             "เรียง",
             ["ใหม่ → เก่า", "เก่า → ใหม่", "ตามสถานะ"],
             key="_call_sort_mode",
-            label_visibility="collapsed",
         )
 
     # Direction filter — derived from filename suffix (-Inbound.wav / -Outbound.wav).
@@ -535,7 +533,6 @@ else:
         ["ทั้งหมด", "สายเข้า (Inbound)", "สายออก (Outbound)"],
         horizontal=True,
         key="_call_direction_filter",
-        label_visibility="collapsed",
     )
 
     # Apply filter
@@ -665,9 +662,9 @@ else:
             chk_col, info_col, action_col = st.columns([0.3, 2, 1])
             with chk_col:
                 st.checkbox(
-                    "เลือก",
+                    "เลือกสายนี้",
                     key=f"chk_{call['id']}",
-                    label_visibility="collapsed",
+                    help="เลือกสายนี้เพื่อใช้กับคำสั่งสำหรับรายการที่เลือก",
                 )
 
             with info_col:
@@ -732,7 +729,10 @@ else:
                             st.caption("ยังไม่มีลูกค้าในระบบ — เพิ่มได้ที่เมนู เพิ่ม/แก้ไขข้อมูลลูกค้า")
                         else:
                             cust_options = {f"{c['first_name']} {c['last_name']} ({c['phone'] or '-'})": c["id"] for c in all_custs}
-                            sel = st.selectbox("เลือกลูกค้า", ["— เลือก —"] + list(cust_options.keys()), key=f"cust_sel_{call['id']}")
+                            sel = st.selectbox(
+                                "เลือกลูกค้า", ["— เลือก —"] + list(cust_options.keys()),
+                                help="เลือกเจ้าของสายก่อนกดเชื่อมข้อมูล", key=f"cust_sel_{call['id']}",
+                            )
                             if sel != "— เลือก —":
                                 cid = cust_options[sel]
                                 warrs = db.get_warranties_by_customer(cid)
@@ -747,6 +747,7 @@ else:
                                     options = {c["id"]: f"#{c['id']} {c['subject']}" for c in cases}
                                     target = st.selectbox("จัดสายเข้าเคส", [None, *options],
                                                           format_func=lambda key: options.get(key, "สร้างเคสใหม่"),
+                                                          help="เลือกเคสเดิมของลูกค้ารายนี้ หรือเลือกสร้างเคสใหม่",
                                                           key=f"case_sel_{call['id']}_{cid}")
                                     plan = {"customer_id": cid, "action": "create"}
                                     if target is not None:
@@ -792,6 +793,8 @@ else:
                                 new_subject = st.text_input(
                                     "แก้ไขหัวข้อเคส",
                                     value=case["subject"],
+                                    placeholder="เช่น ติดตามวันส่งที่นอน",
+                                    help="ระบุเรื่องที่ลูกค้าติดต่อ แล้วกดบันทึกหัวข้อเพื่อใช้ชื่อใหม่",
                                     key=f"case_subj_{call['id']}_{case['id']}",
                                 )
                                 if new_subject != case["subject"]:
@@ -836,7 +839,7 @@ else:
                                             "เลือกเคสปลายทาง",
                                             list(merge_opts.keys()),
                                             key=f"merge_pick_{call['id']}",
-                                            label_visibility="collapsed",
+                                            help="เลือกเคสของลูกค้ารายเดียวกันที่จะรับสายทั้งหมดจากเคสนี้",
                                         )
                                     with m_col2:
                                         if st.button("รวมเคส", key=f"merge_btn_{call['id']}"):

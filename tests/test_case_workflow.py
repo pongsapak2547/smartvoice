@@ -2,12 +2,14 @@
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest import mock
 
 import pytest
 import requests
 
-from smartvoice import audit, case_workflow, db, discord_notify
+from smartvoice import audit, auth, case_workflow, db, discord_notify
 from smartvoice.case_workflow import Actor
 
 PLOY = Actor(username="ploy", name="พลอย", role="Agent")
@@ -152,10 +154,40 @@ def test_claim_lost_to_a_race_reports_the_winner(case_id, sent):
     assert sent == []
 
 
-def test_qa_cannot_claim(case_id, sent):
-    ok, _ = case_workflow.claim(case_id, QA)
-    assert not ok
+@pytest.mark.parametrize("role", auth.ROLES)
+def test_case_roles_can_claim_once(case_id, sent, role):
+    actor = Actor("operator", "ผู้รับเคส", role)
+    db.update_case_status(case_id, "follow_up")
+    assert case_workflow.claim(case_id, actor)[0]
+    row = db.get_case_by_id(case_id)
+    assert (row["assignee_username"], row["assignee_name"], row["status"]) == ("operator", "ผู้รับเคส", "follow_up")
+    assert row["assigned_at"]
+    assert not case_workflow.claim(case_id, actor)[0]
+    assert db.get_case_by_id(case_id) == row
+    assert len(sent) == len(_audit_rows()) == 1
+
+
+@pytest.mark.parametrize("actor", [Actor(" ", "", "Agent"), Actor("operator", "", "unknown"), QA])
+def test_claim_requires_identity_and_case_access(case_id, sent, actor, monkeypatch):
+    monkeypatch.setitem(auth.ROLE_PERMISSIONS, "QA", frozenset())
+    assert not case_workflow.claim(case_id, actor)[0]
     assert db.get_case_by_id(case_id)["assignee_username"] is None
+    assert not sent and not _audit_rows()
+
+
+def test_simultaneous_claims_have_one_owner(case_id, sent):
+    ready = Barrier(2)
+
+    def attempt(actor):
+        ready.wait(timeout=5)
+        return case_workflow.claim(case_id, actor)[0]
+
+    actors = [PLOY, QA]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, actors))
+    assert results.count(True) == 1
+    assert db.get_case_by_id(case_id)["assignee_username"] == actors[results.index(True)].username
+    assert len(sent) == len(_audit_rows()) == 1
 
 
 def test_status_needs_a_claim_and_the_owner(case_id, sent):

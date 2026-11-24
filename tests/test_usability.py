@@ -130,6 +130,84 @@ def test_admin_deletes_only_after_confirmation():
 
 # ── Pages that used to crash ─────────────────────────────────────────────
 
+def _case_claim_app(role):
+    case_id = db.create_case(db.insert_customer(first_name="Test", last_name="User"), "ติดตามสินค้า")
+    app = _signed_in(AppTest.from_string(
+        "import streamlit as st\n"
+        "from smartvoice import db, ui_helpers\n"
+        "ui_helpers.render_case_ownership(db.get_case_detail(st.session_state['case_id']))"
+    ), role)
+    app.session_state["case_id"] = case_id
+    app.run()
+    return app, case_id
+
+
+def test_new_user_role_preview_updates_before_submit(temp_db):
+    app = _signed_in(AppTest.from_file("pages/5_👤_Users.py", default_timeout=30)).run()
+    count = db.count_users()
+    for role in auth.ROLES:
+        picker = app.selectbox(key="_add_user_role")
+        assert not picker.proto.form_id
+        picker.select(role).run()
+        preview = next(m.value for m in app.markdown if "สิทธิ์ของบทบาทที่เลือก" in m.value)
+        assert preview.splitlines()[2:] == [f"- {auth.PAGE_LABELS_TH[p]}" for p in auth.visible_pages(role)]
+        assert not app.exception and not app.error and db.count_users() == count
+
+    app.selectbox(key="_add_user_role").select("QA").run()
+    fields = {field.label: field for field in app.text_input}
+    fields["ชื่อผู้ใช้ (Username)"].input("new_staff")
+    fields["รหัสผ่านเริ่มต้น"].input("synthetic-password")
+    fields["ยืนยันรหัสผ่าน"].input("synthetic-password")
+    next(button for button in app.button if button.label == "สร้างบัญชี").click().run()
+    assert not app.exception and db.get_user_by_username("new_staff")["role"] == "QA"
+
+
+@pytest.mark.parametrize("role", auth.ROLES)
+def test_authenticated_user_can_press_claim(temp_db, monkeypatch, role):
+    monkeypatch.setattr("smartvoice.discord_notify.send", lambda payload: None)
+    app, case_id = _case_claim_app(role)
+    next(button for button in app.button if button.label == "รับเคสนี้").click().run()
+    assert not app.exception
+    row = db.get_case_by_id(case_id)
+    assert (row["assignee_username"], row["assignee_name"], row["status"]) == ("tester", "ทดสอบ", "open")
+    assert row["assigned_at"]
+
+
+def test_claim_rechecks_account_after_button_was_displayed(temp_db):
+    app, case_id = _case_claim_app("QA")
+    db.update_user(app.session_state["current_user_id"], is_active=False)
+    next(button for button in app.button if button.label == "รับเคสนี้").click().run()
+    assert not app.exception and not app.button
+    assert db.get_case_by_id(case_id)["assignee_username"] is None
+
+
+def test_customer_form_phone_guidance_matches_validation(temp_db):
+    app = _signed_in(AppTest.from_file("pages/6_➕_Data_Entry.py", default_timeout=30)).run()
+    fields = {field.label: field for field in app.text_input}
+    assert "9–10 หลัก" in fields["เบอร์โทร"].proto.help
+    fields["ชื่อ *"].input("สมชาย")
+    fields["นามสกุล *"].input("ใจดี")
+    fields["เบอร์โทร"].input("123")
+    next(button for button in app.button if button.label == "บันทึกลูกค้า").click().run()
+    assert any("9-10 หลัก" in error.value for error in app.error)
+    next(field for field in app.text_input if field.label == "เบอร์โทร").input("0812345678")
+    next(button for button in app.button if button.label == "บันทึกลูกค้า").click().run()
+    assert not app.exception and db.get_customer_by_phone("0812345678")
+    assert any("3 ตัวอักษร" in field.proto.help for field in app.text_input if field.label == "เลขทะเบียนรับประกัน *")
+
+
+def test_so_form_number_guidance_matches_validation(temp_db):
+    app = _signed_in(AppTest.from_file("pages/13_Sales_Orders.py", default_timeout=30)).run()
+    number_key = "_so_so_number_new"
+    assert "2 ตัวอักษร" in app.text_input(key=number_key).proto.help
+    app.text_input(key=number_key).input("X")
+    app.button(key="_so_save_new").click().run()
+    assert any("2 ตัวอักษร" in error.value for error in app.error)
+    app.text_input(key=number_key).input("SO-001")
+    app.button(key="_so_save_new").click().run()
+    assert not app.exception and db.get_sales_order(so_number="SO-001")
+
+
 def test_customer_search_with_no_match_shows_a_message(temp_db):
     db.insert_customer(first_name="สมชาย", last_name="ใจดี", phone="0812345678")
     at = _signed_in(AppTest.from_file("pages/3_👥_Customers.py", default_timeout=30), "Agent")

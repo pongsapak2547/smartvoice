@@ -15,11 +15,13 @@ from smartvoice.ui_helpers import init_page, render_proof
 current_user, current_role = init_page(PAGE_DATA_ENTRY)
 
 st.title("ข้อมูลลูกค้า & ทะเบียนรับประกัน")
-st.caption("เพิ่ม / แก้ไข / ลบ ข้อมูลลูกค้าและทะเบียนรับประกัน — ค้นหาและดูภาพรวมได้ที่เมนู ลูกค้าและการรับประกัน")
+st.caption("เพิ่ม / แก้ไข / ลบ ข้อมูลลูกค้าและทะเบียนรับประกัน — ช่องที่มี * จำเป็นต้องระบุ ช่องอื่นเว้นว่างหรือใช้ค่าเริ่มต้นได้")
 
 _OTHER = "อื่นๆ"
 _NONE = "—"
 _FLASH_KEY = "_data_entry_flash"
+_PHONE_HELP = "ระบุเบอร์ที่ไม่ซ้ำกับลูกค้ารายอื่น ขึ้นต้นด้วย 0 และมี 9–10 หลัก เช่น 0812345678"
+_REGISTRATION_HELP = "ใช้เลขทะเบียนที่ไม่ซ้ำ อย่างน้อย 3 ตัวอักษร ใช้ตัวอักษรอังกฤษ ตัวเลข หรือ . _ - / ได้"
 
 # Saving reruns the page so the pickers and tables pick up the change, which
 # would otherwise wipe the success message before anyone reads it.
@@ -55,12 +57,13 @@ def _pick_with_other(label: str, options, key: str, current: str | None = None):
     else:
         index = 0
 
-    choice = st.selectbox(label, choices, index=index, key=key)
+    choice = st.selectbox(label, choices, index=index, key=key, help="เลือกจากรายการ หรือเลือก อื่นๆ เพื่อพิมพ์เอง")
     if choice == _OTHER:
         typed = st.text_input(
             f"{label} (ระบุเอง)",
             value="" if current in options else (current or ""),
             key=f"{key}_other",
+            placeholder=f"พิมพ์{label}ตามเอกสาร",
         )
         return typed.strip() or None
     return None if choice == _NONE else choice
@@ -97,13 +100,13 @@ with tab_customer:
             with c1:
                 first_name = st.text_input("ชื่อ *", placeholder="สมชาย")
                 last_name = st.text_input("นามสกุล *", placeholder="ใจดี")
-                phone = st.text_input("เบอร์โทร", placeholder="0812345678")
+                phone = st.text_input("เบอร์โทร", help=_PHONE_HELP, placeholder="0812345678")
                 email = st.text_input("อีเมล", placeholder="somchai@email.com")
-                nick_name = st.text_input("ชื่อเล่น")
+                nick_name = st.text_input("ชื่อเล่น", placeholder="เช่น นิด")
                 cust_channel = st.selectbox("ช่องทาง (แบรนด์ที่ลูกค้าติดต่อ)", (_NONE, *customer_entry.CHANNELS))
                 gender = st.selectbox("เพศ", (_NONE, *customer_entry.GENDERS))
                 dob = st.date_input(
-                    "วันเกิด",
+                    "วันเกิด", help="เลือกวันเกิดตั้งแต่ 1 มกราคม ค.ศ. 1920 ถึงวันนี้",
                     value=None,
                     min_value=date(1920, 1, 1),
                     max_value=date.today(),
@@ -113,11 +116,11 @@ with tab_customer:
                 address = st.text_area("ที่อยู่", placeholder="123/45 หมู่บ้าน ...", height=100)
                 a1, a2 = st.columns(2)
                 with a1:
-                    subdistrict = st.text_input("แขวง/ตำบล")
-                    city_province = st.text_input("จังหวัด")
+                    subdistrict = st.text_input("แขวง/ตำบล", placeholder="เช่น ลาดยาว")
+                    city_province = st.text_input("จังหวัด", placeholder="เช่น กรุงเทพมหานคร")
                 with a2:
-                    district = st.text_input("เขต/อำเภอ")
-                    postcode = st.text_input("รหัสไปรษณีย์")
+                    district = st.text_input("เขต/อำเภอ", placeholder="เช่น จตุจักร")
+                    postcode = st.text_input("รหัสไปรษณีย์", placeholder="เช่น 10900")
                 country = st.text_input("ประเทศ", value="Thailand")
 
             st.caption("* จำเป็นต้องกรอก — เบอร์โทรต้องไม่ซ้ำกับลูกค้ารายอื่น (ใช้เชื่อมสายเข้าอัตโนมัติ)")
@@ -180,11 +183,11 @@ with tab_customer:
             with st.form(f"_edit_customer_form_{cid}"):
                 e1, e2 = st.columns(2)
                 with e1:
-                    ed_first = st.text_input("ชื่อ *", value=picked["first_name"])
-                    ed_last = st.text_input("นามสกุล *", value=picked["last_name"])
-                    ed_phone = st.text_input("เบอร์โทร", value=picked["phone"] or "")
-                    ed_email = st.text_input("อีเมล", value=picked["email"] or "")
-                    ed_nick = st.text_input("ชื่อเล่น", value=picked.get("nick_name") or "")
+                    ed_first = st.text_input("ชื่อ *", placeholder="สมชาย", value=picked["first_name"])
+                    ed_last = st.text_input("นามสกุล *", placeholder="ใจดี", value=picked["last_name"])
+                    ed_phone = st.text_input("เบอร์โทร", help=_PHONE_HELP, value=picked["phone"] or "")
+                    ed_email = st.text_input("อีเมล", placeholder="somchai@example.com", value=picked["email"] or "")
+                    ed_nick = st.text_input("ชื่อเล่น", placeholder="เช่น นิด", value=picked.get("nick_name") or "")
                     channels = (_NONE, *customer_entry.CHANNELS)
                     if picked.get("channel") and picked["channel"] not in channels:
                         channels = (*channels, picked["channel"])
@@ -200,21 +203,21 @@ with tab_customer:
                         index=genders.index(picked["gender"]) if picked["gender"] in genders else 0,
                     )
                     ed_dob = st.date_input(
-                        "วันเกิด",
+                        "วันเกิด", help="เลือกวันเกิดตั้งแต่ 1 มกราคม ค.ศ. 1920 ถึงวันนี้",
                         value=_as_date(picked["date_of_birth"]),
                         min_value=date(1920, 1, 1),
                         max_value=date.today(),
                         format="YYYY-MM-DD",
                     )
                 with e2:
-                    ed_address = st.text_area("ที่อยู่", value=picked["address"] or "", height=100)
+                    ed_address = st.text_area("ที่อยู่", placeholder="123/45 หมู่บ้าน ...", value=picked["address"] or "", height=100)
                     b1, b2 = st.columns(2)
                     with b1:
-                        ed_subdistrict = st.text_input("แขวง/ตำบล", value=picked["subdistrict"] or "")
-                        ed_city = st.text_input("จังหวัด", value=picked["city_province"] or "")
+                        ed_subdistrict = st.text_input("แขวง/ตำบล", placeholder="เช่น ลาดยาว", value=picked["subdistrict"] or "")
+                        ed_city = st.text_input("จังหวัด", placeholder="เช่น กรุงเทพมหานคร", value=picked["city_province"] or "")
                     with b2:
-                        ed_district = st.text_input("เขต/อำเภอ", value=picked["district"] or "")
-                        ed_postcode = st.text_input("รหัสไปรษณีย์", value=picked["postcode"] or "")
+                        ed_district = st.text_input("เขต/อำเภอ", placeholder="เช่น จตุจักร", value=picked["district"] or "")
+                        ed_postcode = st.text_input("รหัสไปรษณีย์", placeholder="เช่น 10900", value=picked["postcode"] or "")
                     ed_country = st.text_input("ประเทศ", value=picked["country"] or "Thailand")
 
                 edit_submitted = st.form_submit_button("บันทึกการแก้ไข", use_container_width=True)
@@ -307,26 +310,26 @@ with tab_warranty:
 
             w1, w2, w3 = st.columns(3)
             with w1:
-                registration_no = st.text_input("เลขทะเบียนรับประกัน *", placeholder="W011OZ25011")
+                registration_no = st.text_input("เลขทะเบียนรับประกัน *", help=_REGISTRATION_HELP, placeholder="W011OZ25011")
                 certificate_no = st.text_input("เลขที่ใบรับประกัน", placeholder="CERT-OZ-011")
-                serial_no = st.text_input("Serial No.", placeholder="SN-OZ-011")
-                label_no = st.text_input("Label No.", placeholder="LB-OZ-011")
+                serial_no = st.text_input("หมายเลขประจำสินค้า (Serial No.)", placeholder="SN-OZ-011")
+                label_no = st.text_input("เลขบนป้ายสินค้า (Label No.)", placeholder="LB-OZ-011")
                 channel = _pick_with_other("ช่องทาง (แบรนด์ร้าน)", customer_entry.CHANNELS, "_w_channel")
             with w2:
                 brand = _pick_with_other("แบรนด์", customer_entry.BRANDS, "_w_brand")
                 category = _pick_with_other("หมวดหมู่", customer_entry.CATEGORIES, "_w_category")
                 model = st.text_input("รุ่น", placeholder="Natura Latex")
                 size = st.text_input("ขนาด", placeholder="5ft")
-                sku = st.text_input("SKU", placeholder="OZ-NL-5FT-011")
+                sku = st.text_input("รหัสสินค้า (SKU)", placeholder="OZ-NL-5FT-011")
             with w3:
                 purchase_channel = _pick_with_other(
                     "ช่องทางซื้อ", customer_entry.PURCHASE_CHANNELS, "_w_purchase_channel"
                 )
-                order_number = st.text_input("เลขที่คำสั่งซื้อ (ร้านค้า/marketplace)")
+                order_number = st.text_input("เลขที่คำสั่งซื้อ (ร้านค้า/marketplace)", placeholder="เช่น ORD-001")
                 so_number = st.text_input("เลขที่ SO", help="ใบสั่งขายของบริษัท — ดูรายละเอียดได้ที่เมนู ใบสั่งขาย (SO)")
-                ref_id = st.text_input("Ref Id", help="เลขอ้างอิงจากระบบลงทะเบียนรับประกัน")
+                ref_id = st.text_input("เลขอ้างอิงทะเบียน (Ref Id)", help="เลขอ้างอิงจากระบบลงทะเบียนรับประกัน")
                 warranty_period_months = st.number_input(
-                    "ระยะเวลารับประกัน (เดือน)", min_value=0, max_value=600, value=120, step=12
+                    "ระยะเวลารับประกัน (เดือน)", help="ระบุจำนวนเดือนตั้งแต่ 0 ถึง 600 ตามเงื่อนไขรับประกัน", min_value=0, max_value=600, value=120, step=12
                 )
                 date_of_purchase = st.date_input("วันที่ซื้อ", value=date.today(), format="YYYY-MM-DD")
                 date_of_delivery = st.date_input("วันที่ส่งมอบ", value=None, format="YYYY-MM-DD")
@@ -339,7 +342,7 @@ with tab_warranty:
             if not use_auto:
                 expiry_date = st.date_input("วันหมดประกัน", value=None, format="YYYY-MM-DD")
 
-            remark = st.text_area("หมายเหตุ", height=80)
+            remark = st.text_area("หมายเหตุ", placeholder="เช่น รายละเอียดเพิ่มเติมเกี่ยวกับการรับประกัน", height=80)
             proof = st.file_uploader(
                 "หลักฐานการซื้อ (ใบเสร็จ/สลิป) — รูป JPG/PNG/WEBP หรือ PDF ไม่เกิน 10 MB",
                 type=["jpg", "jpeg", "png", "webp", "pdf"],
@@ -428,16 +431,16 @@ with tab_warranty:
                 x1, x2, x3 = st.columns(3)
                 with x1:
                     ed_reg = st.text_input(
-                        "เลขทะเบียนรับประกัน *", value=picked_w["registration_no"], key=f"_ew_reg_{wid}"
+                        "เลขทะเบียนรับประกัน *", help=_REGISTRATION_HELP, value=picked_w["registration_no"], key=f"_ew_reg_{wid}"
                     )
                     ed_cert = st.text_input(
-                        "เลขที่ใบรับประกัน", value=picked_w["certificate_no"] or "", key=f"_ew_cert_{wid}"
+                        "เลขที่ใบรับประกัน", placeholder="CERT-OZ-011", value=picked_w["certificate_no"] or "", key=f"_ew_cert_{wid}"
                     )
                     ed_serial = st.text_input(
-                        "Serial No.", value=picked_w["serial_no"] or "", key=f"_ew_serial_{wid}"
+                        "หมายเลขประจำสินค้า (Serial No.)", placeholder="SN-OZ-011", value=picked_w["serial_no"] or "", key=f"_ew_serial_{wid}"
                     )
                     ed_label = st.text_input(
-                        "Label No.", value=picked_w["label_no"] or "", key=f"_ew_label_{wid}"
+                        "เลขบนป้ายสินค้า (Label No.)", placeholder="LB-OZ-011", value=picked_w["label_no"] or "", key=f"_ew_label_{wid}"
                     )
                     ed_channel = _pick_with_other(
                         "ช่องทาง (แบรนด์ร้าน)", customer_entry.CHANNELS,
@@ -450,9 +453,9 @@ with tab_warranty:
                     ed_category = _pick_with_other(
                         "หมวดหมู่", customer_entry.CATEGORIES, f"_ew_category_{wid}", picked_w["category"]
                     )
-                    ed_model = st.text_input("รุ่น", value=picked_w["model"] or "", key=f"_ew_model_{wid}")
-                    ed_size = st.text_input("ขนาด", value=picked_w["size"] or "", key=f"_ew_size_{wid}")
-                    ed_sku = st.text_input("SKU", value=picked_w["sku"] or "", key=f"_ew_sku_{wid}")
+                    ed_model = st.text_input("รุ่น", placeholder="Natura Latex", value=picked_w["model"] or "", key=f"_ew_model_{wid}")
+                    ed_size = st.text_input("ขนาด", placeholder="5ft", value=picked_w["size"] or "", key=f"_ew_size_{wid}")
+                    ed_sku = st.text_input("รหัสสินค้า (SKU)", placeholder="OZ-NL-5FT-011", value=picked_w["sku"] or "", key=f"_ew_sku_{wid}")
                 with x3:
                     ed_owner = st.selectbox(
                         "ลูกค้าเจ้าของทะเบียน *",
@@ -465,17 +468,17 @@ with tab_warranty:
                         f"_ew_purchase_{wid}", picked_w["purchase_channel"],
                     )
                     ed_order = st.text_input(
-                        "เลขที่คำสั่งซื้อ (ร้านค้า/marketplace)", value=picked_w["order_number"] or "",
+                        "เลขที่คำสั่งซื้อ (ร้านค้า/marketplace)", placeholder="เช่น ORD-001", value=picked_w["order_number"] or "",
                         key=f"_ew_order_{wid}",
                     )
                     ed_so = st.text_input(
-                        "เลขที่ SO", value=picked_w.get("so_number") or "", key=f"_ew_so_{wid}"
+                        "เลขที่ SO", help="เลขที่ใบสั่งขายของบริษัท", value=picked_w.get("so_number") or "", key=f"_ew_so_{wid}"
                     )
                     ed_ref = st.text_input(
-                        "Ref Id", value=picked_w.get("ref_id") or "", key=f"_ew_ref_{wid}"
+                        "เลขอ้างอิงทะเบียน (Ref Id)", value=picked_w.get("ref_id") or "", key=f"_ew_ref_{wid}"
                     )
                     ed_months = st.number_input(
-                        "ระยะเวลารับประกัน (เดือน)",
+                        "ระยะเวลารับประกัน (เดือน)", help="ระบุจำนวนเดือนตั้งแต่ 0 ถึง 600 ตามเงื่อนไขรับประกัน",
                         min_value=0, max_value=600, step=12,
                         value=int(picked_w["warranty_period_months"] or 0),
                         key=f"_ew_months_{wid}",
@@ -502,7 +505,7 @@ with tab_warranty:
                         format="YYYY-MM-DD", key=f"_ew_expiry_{wid}",
                     )
                 ed_remark = st.text_area(
-                    "หมายเหตุ", value=picked_w["remark"] or "", height=80, key=f"_ew_remark_{wid}"
+                    "หมายเหตุ", placeholder="เช่น รายละเอียดเพิ่มเติมเกี่ยวกับการรับประกัน", value=picked_w["remark"] or "", height=80, key=f"_ew_remark_{wid}"
                 )
                 proof_col, upload_col = st.columns([1, 2])
                 with proof_col:

@@ -1,5 +1,24 @@
 # SmartVoice — สถานะสำหรับพัฒนาต่อ
 
+## AWS Academy EC2 — Deploy และตรวจรับหลังอัปเดต (24 พฤศจิกายน 2026)
+
+**สถานะ: Deployment completed; functional validation partially completed; ไม่ใช่ Production Ready.** ข้อมูลส่วนนี้บันทึกจากคำสั่ง Terminal และภาพหน้าจอที่ผู้ใช้ส่งในการสนทนา ไม่ใช่การรันตรวจสอบ AWS โดยตัวแก้เอกสารโดยตรง
+
+- **Source/Deployment:** ผู้ใช้ยืนยัน local branch `test/phase6-e2e` clean ที่ commit `2480e5f` (`fix: enable case claiming for all roles and improve form UX`) และสร้าง `git archive` จาก commit นี้ ส่งขึ้น EC2 โดย SHA256 ฝั่ง Windows/EC2 ตรงกัน `db672382a6d2b13fa34422e67967f7323ec47b824b100d1d75ca35367fd1c7bf`. ติดตั้งด้วย `sudo bash /home/ubuntu/smartvoice-src/deploy/aws-ec2/install.sh --domain 44-221-132-254.sslip.io`; installer จบโดยไม่มี error ใน log ที่ส่งมา; release ใหม่ `/opt/smartvoice/releases/release-GXEX1Hi9`; `/opt/smartvoice/venv` ชี้ไปที่ release นี้
+- **Infrastructure post-deploy:** `smartvoice`, `caddy`, `postgresql` และ `smartvoice-backup.timer` active; health `http://127.0.0.1:8501/_stcore/health` และ `https://44-221-132-254.sslip.io/_stcore/health` ตอบ `ok`; `journalctl -u smartvoice.service -n 30 -p err` ไม่พบรายการในช่วงที่ตรวจ ไม่เท่ากับรับรองว่าไม่มีปัญหาทั้งระบบ
+- **Backup ก่อน Deploy:** PostgreSQL dump `smartvoice-20261123T162003Z.dump` ตรวจ `pg_restore --list` อ่านได้ (ไม่ได้ทดสอบ restore รอบนี้); archive ที่รวม dump กับ `data/raw_audio` ถูกดาวน์โหลดไป Windows และ SHA256 ทั้งสองฝั่งตรงกัน `aa9dd3389b0df2cf33007685a185f92df13de41570233aece68ac2fd2272bb9e`. ไม่ได้ commit/upload backup หรือข้อมูลลูกค้าเข้า GitHub; `S3_BUCKET` ยังไม่ได้ตั้งค่า และ backup ประจำเครื่องไม่ใช่ off-instance backup. ไฟล์พิเศษบน EC2 `scripts/seed_mock_business_data.py` ไม่มีใน release ใหม่ จึงเก็บสำเนา `/home/ubuntu/seed_mock_business_data.py.predeploy-20261123` พร้อม SHA256 ตรงกับต้นฉบับก่อนติดตั้ง (สำเนานี้ยังอยู่บน EC2)
+- **Functional UI ที่ผู้ใช้ทดสอบหลัง Deploy:** Admin login, หน้า Users แสดงบัญชีเดิม และเลือก Role แล้วรายการสิทธิ์เปลี่ยนตามที่เลือก; Agent `agtest` รับ MOCK Case #15, QA `qatest` รับ #17, Supervisor `sptest` รับ #14, Admin รับ #16 สำเร็จ โดย UI แสดงข้อความยืนยันและชื่อผู้รับ; QA และ Admin เห็นว่า Case #15 มี `agtest` รับอยู่แล้ว และ UI ไม่แสดงปุ่มรับซ้ำ. เป็นหลักฐานการทำงานผ่านเว็บ ไม่ใช่การทดสอบ backend concurrency, transactional persistence หรือ security bypass โดยตรง
+- **ยังไม่ทดสอบ / เลื่อนออกไป:** STT/AI end-to-end หลัง Deploy (ผู้ใช้เลือกเลื่อน), ความถูกต้อง Transcript/diarization/AI, การสร้างบัญชีจริง, การ restore ฐานข้อมูลรอบนี้, case-claim concurrency และการทดสอบโหลด; ต้องทำก่อนรับรอง Production
+- **ขอบเขต:** AWS Academy Learner Lab ใช้สำหรับ Technical Pilot เท่านั้น; หลีกเลี่ยงข้อมูลลูกค้าจริง; ตรวจ Security/Secrets, backup/restore และการคงอยู่ของทรัพยากรก่อนใช้งานบริษัทจริง. Repository GitHub ณ รอบตรวจล่าสุดมี visibility เป็น **Public** แม้เอกสารประวัติเก่าเคยระบุ Private: ต้องตรวจ/เปลี่ยนเป็น Private ตามนโยบายโปรเจ็กต์ก่อนเผยแพร่ข้อมูลภายใน
+- **Git handoff:** บันทึกรอบนี้แก้เฉพาะ `PROJECT_STATUS.md` บน branch `test/phase6-e2e` หลัง Deploy commit `2480e5f`; ไม่มีการแก้ application code, push deployment ใหม่ หรือ merge เข้า `master`. หลังจากนี้ local checkout ต้อง `git pull --ff-only` บน branch เดิมก่อนทำงานต่อ หากไม่มี local edits
+
+
+## หลังการนำเสนอ (23 พฤศจิกายน 2026)
+
+- ทั้ง 4 บทบาทที่มีสิทธิ์เปิดหน้าเคสรับเคสว่างที่ยังไม่ปิดได้ ระบบเก็บชื่อบัญชี ชื่อผู้รับ และเวลารับ โดยคงสถานะเคสเดิม
+- ปรับคำอธิบายภาษาไทยในฟอร์มและตัวกรองให้ตรงกับกฎเดิม รวมถึงรูปแบบเบอร์โทร เลขทะเบียน เลขที่ SO และขนาดไฟล์เสียง
+- ทดสอบเฉพาะส่วนที่เกี่ยวข้องผ่าน 309 กรณีบน SQLite ทดสอบและ API จำลอง รวมการกดรับผ่าน UI ทุกบทบาท การเพิกถอนสิทธิ์ การรับพร้อมกัน และการส่งฟอร์มด้วยค่าที่ถูกและผิด
+
 ## Omazz — เตรียมเดโมในเครื่อง (20 พฤศจิกายน 2026)
 
 - ฐาน Git `test/phase6-e2e` ที่ `ae28f3c` พร้อม staged cleanup เดิม (baseline 739 passed, 17 skipped) รุ่นเสนออนุมัติยังไม่มี commit SHA

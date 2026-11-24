@@ -12,6 +12,7 @@ from smartvoice import audit as audit_trail
 from smartvoice import case_workflow, db, labels, login_guard, pipeline, processing_control
 from smartvoice.auth import (
     DEFAULT_ADMIN_PASSWORD,
+    MIN_PASSWORD_LENGTH,
     DEFAULT_ADMIN_USERNAME,
     PAGE_ADMIN,
     PAGE_LABELS_TH,
@@ -296,8 +297,11 @@ def render_login_page():
             )
 
         with st.form("_login_form"):
-            username = st.text_input("ชื่อผู้ใช้ (Username)", key="_login_username")
-            password = st.text_input("รหัสผ่าน", type="password", key="_login_password")
+            username = st.text_input(
+                "ชื่อผู้ใช้ (Username)", key="_login_username", placeholder="เช่น somchai.p",
+                help="กรอกชื่อบัญชีพนักงานที่ใช้เข้าสู่ระบบ",
+            )
+            password = st.text_input("รหัสผ่าน", type="password", key="_login_password", help="กรอกรหัสผ่านของบัญชีนี้")
             submitted = st.form_submit_button(
                 "เข้าสู่ระบบ", use_container_width=True, disabled=bool(client_locked)
             )
@@ -372,9 +376,9 @@ def render_change_password():
             return
 
         with st.form("_change_password_form"):
-            current = st.text_input("รหัสผ่านปัจจุบัน", type="password")
-            new_password = st.text_input("รหัสผ่านใหม่", type="password")
-            confirm = st.text_input("ยืนยันรหัสผ่านใหม่", type="password")
+            current = st.text_input("รหัสผ่านปัจจุบัน", type="password", help="กรอกรหัสผ่านที่ใช้เข้าสู่ระบบเพื่อยืนยันตัวตน")
+            new_password = st.text_input("รหัสผ่านใหม่", type="password", help=f"ตั้งรหัสผ่านอย่างน้อย {MIN_PASSWORD_LENGTH} ตัวอักษร")
+            confirm = st.text_input("ยืนยันรหัสผ่านใหม่", type="password", help="กรอกรหัสผ่านใหม่อีกครั้งให้ตรงกัน")
             submitted = st.form_submit_button("บันทึกรหัสผ่านใหม่", use_container_width=True)
 
         if submitted:

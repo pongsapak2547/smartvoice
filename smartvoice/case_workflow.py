@@ -21,14 +21,12 @@ import re
 from dataclasses import dataclass
 
 from smartvoice import audit, db, discord_notify
-from smartvoice.auth import normalize_role
+from smartvoice.auth import PAGE_CASES, ROLE_PERMISSIONS, normalize_role
 from smartvoice.ollama_client import sanitize_next_action
 
 STATUSES = ("open", "follow_up", "closed")
 STATUS_LABELS_TH = discord_notify.STATUS_LABELS_TH
 
-# QA reviews calls, it does not work cases.
-CLAIM_ROLES = frozenset({"Admin", "Supervisor", "Agent"})
 # May free a case someone else holds.
 RELEASE_OTHERS_ROLES = frozenset({"Admin", "Supervisor"})
 
@@ -58,10 +56,10 @@ def assignee_label(case: dict) -> str:
 def claim_error(case: dict | None, actor: Actor) -> str | None:
     if not case:
         return "ไม่พบเคสนี้ — อาจถูกรวมเข้ากับเคสอื่นไปแล้ว"
-    if not actor.username:
+    if not (actor.username or "").strip():
         return "ไม่พบชื่อผู้ใช้ของบัญชีนี้ — กรุณาออกจากระบบแล้วเข้าใหม่"
-    if actor.normalized_role not in CLAIM_ROLES:
-        return f"บทบาท {actor.normalized_role} รับเคสไม่ได้"
+    if PAGE_CASES not in ROLE_PERMISSIONS.get(actor.role, ()):
+        return "บัญชีนี้ไม่มีสิทธิ์เข้าถึงเคส"
     if case.get("status") == "closed":
         return "เคสนี้ปิดไปแล้ว รับไม่ได้"
     if case.get("assignee_username"):
