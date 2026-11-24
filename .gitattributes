@@ -1,0 +1,4 @@
+# Shell scripts and server config run on Linux: keep LF even in a Windows checkout
+# (core.autocrlf would otherwise turn them into CRLF, which bash and systemd reject).
+*.sh text eol=lf
+deploy/** text eol=lf

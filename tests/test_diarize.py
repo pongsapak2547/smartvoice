@@ -4,7 +4,6 @@ from smartvoice.stt.diarize import (
     _group_words_by_speaker_and_pause,
     _pick_speaker_for_word,
 )
-from smartvoice.stt.transcribe import _hotwords_text
 
 
 class TestDiarizationHelpers(unittest.TestCase):
@@ -55,15 +54,6 @@ class TestDiarizationHelpers(unittest.TestCase):
         self.assertEqual(result[0]["text"], "หนึ่ง")
         self.assertEqual(result[1]["text"], "สองสาม")
 
-    def test_hotwords_text_contains_domain_terms(self):
-        hotwords = _hotwords_text()
-
-        self.assertIn("Restonic", hotwords)
-        self.assertIn("Trade-in", hotwords)
-        self.assertIn("หาดใหญ่", hotwords)
-        self.assertIn("โปรราคาพิเศษ", hotwords)
-        self.assertIn("ภาคใต้", hotwords)
-        self.assertIn("ทางห้าง", hotwords)
 
 
 if __name__ == "__main__":

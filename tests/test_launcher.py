@@ -26,3 +26,9 @@ def test_launcher_bootstraps_supported_python_without_unsupported_fallbacks():
     assert 'set "PATH_PY_VERSION="' in run_bat
     assert 'if "%PATH_PY_VERSION%"=="3.10" set "PY_CMD=python"' in run_bat
     assert 'if "%PATH_PY_VERSION%"=="3.11" set "PY_CMD=python"' in run_bat
+
+
+def test_windows_launcher_accepts_python_312():
+    run_bat = Path("run.bat").read_text(encoding="utf-8")
+    assert 'py -3.12 --version' in run_bat
+    assert 'if "%PATH_PY_VERSION%"=="3.12" set "PY_CMD=python"' in run_bat

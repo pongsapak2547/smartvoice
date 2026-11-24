@@ -93,6 +93,58 @@ def save_audio_file(file_bytes: bytes, filename: str, file_hash: str = "") -> st
 _THAI_PHONE_RE = re.compile(r"(?<![\d])0\d{9}(?![\d])")
 
 
+def remove_audio_file(path: str | None) -> bool:
+    """Delete a stored audio file. Returns False when it exists but can't be
+    removed (e.g. open in a media player on Windows) — never raises, so one
+    locked file can't stop a bulk delete halfway."""
+    if not path:
+        return True
+    try:
+        for candidate in (path, str(path) + ".smartvoice-api.json", str(path) + ".smartvoice-api.json.tmp"):
+            if os.path.exists(candidate):
+                os.remove(candidate)
+    except OSError:
+        return False
+    return True
+
+
+# ── Proof-of-purchase files (warranty registrations) ─────────────────────
+PROOF_DIR = os.path.join("data", "warranty_proofs")
+MAX_PROOF_SIZE_MB = 10
+_PROOF_SIGS = {b"\xff\xd8\xff": ".jpg", b"\x89PNG\r\n\x1a\n": ".png", b"%PDF": ".pdf"}
+
+
+def sniff_proof_type(file_bytes: bytes) -> str | None:
+    """'.jpg' / '.png' / '.pdf' by content, not by the name the user gave it."""
+    for sig, ext in _PROOF_SIGS.items():
+        if file_bytes.startswith(sig):
+            return ext
+    if file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def save_proof_file(file_bytes: bytes) -> tuple[str | None, str | None]:
+    """Store a receipt/slip image or PDF. Returns (path, error_message).
+
+    Files are named by their SHA-256, so uploading the same receipt twice
+    keeps one copy. Old proofs are never removed — the audit log points at them.
+    """
+    if not file_bytes:
+        return None, "ไฟล์ว่างเปล่า"
+    if len(file_bytes) > MAX_PROOF_SIZE_MB * 1024 * 1024:
+        return None, f"ไฟล์ใหญ่เกิน {MAX_PROOF_SIZE_MB} MB"
+    ext = sniff_proof_type(file_bytes)
+    if not ext:
+        return None, "รองรับเฉพาะรูป JPG / PNG / WEBP หรือไฟล์ PDF"
+    os.makedirs(PROOF_DIR, exist_ok=True)
+    path = os.path.join(PROOF_DIR, compute_file_hash(file_bytes) + ext)
+    if not os.path.exists(path):
+        with open(path, "wb") as fh:
+            fh.write(file_bytes)
+    return path, None
+
+
 def extract_phone_from_filename(filename: str) -> str | None:
     """Extract a Thai phone number (10 digits starting with 0) from a filename.
 
@@ -103,3 +155,64 @@ def extract_phone_from_filename(filename: str) -> str | None:
     name = os.path.splitext(filename)[0]
     match = _THAI_PHONE_RE.search(name)
     return match.group(0) if match else None
+
+
+def extract_direction_from_filename(filename: str) -> str | None:
+    """Detect call direction from CDR-style filenames.
+
+    Filenames produced by the recording system end with `-Inbound.wav` or
+    `-Outbound.wav`. Returns "inbound" / "outbound" / None (when the suffix
+    is missing — e.g. manually renamed files).
+    """
+    if not filename:
+        return None
+    lower = filename.lower()
+    if "inbound" in lower:
+        return "inbound"
+    if "outbound" in lower:
+        return "outbound"
+    return None
+
+
+def extract_agent_code_from_filename(filename: str) -> str | None:
+    """Extract the agent (extension) code from a CDR-style filename.
+
+    Example layouts produced by Omazz's recording system:
+      Outbound: 20251104173706-1762252614.105999-104-0819979336-Outbound.wav
+      Inbound:  20251225134209-1766644826.135925-0631451550-104-Inbound.wav
+
+    The agent extension is always a short numeric segment (2-5 digits)
+    distinct from:
+      • the 14-digit timestamp prefix
+      • a 10-digit Thai phone number starting with "0"
+    """
+    if not filename:
+        return None
+    name = os.path.splitext(filename)[0]
+    for seg in name.split("-"):
+        seg = seg.strip()
+        if not seg.isdigit():
+            continue
+        if len(seg) == 14:                     # timestamp prefix
+            continue
+        if len(seg) == 10 and seg.startswith("0"):  # Thai phone
+            continue
+        if 2 <= len(seg) <= 5:
+            return seg
+    return None
+
+
+def extract_call_time_from_filename(filename: str) -> datetime | None:
+    """When the call actually happened, from the CDR filename's leading
+    YYYYMMDDHHMMSS (the phone system's local time).
+
+    `calls.created_at` is the upload time, not the call time — this is the
+    one to show staff. None when the name has no valid timestamp.
+    """
+    match = re.match(r"(\d{14})", os.path.basename(filename or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None

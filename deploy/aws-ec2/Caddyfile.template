@@ -1,0 +1,25 @@
+# HTTPS front for SmartVoice — install.sh replaces __DOMAIN__ and copies this to
+# /etc/caddy/Caddyfile. Caddy gets and renews the certificate itself (needs
+# ports 80 and 443 open to the internet) and proxies the Streamlit WebSocket.
+#
+# Caddy ignores X-Forwarded-For sent by the client and sets it to the real
+# peer address; the login throttle (smartvoice/login_guard.py) relies on that.
+
+__DOMAIN__ {
+	encode gzip
+
+	# Audio uploads: Streamlit's own limit is 200 MB per file.
+	request_body {
+		max_size 210MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8501
+}

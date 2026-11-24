@@ -3,8 +3,8 @@ import re
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from smartvoice import db, ollama_client
-from smartvoice.config import CASE_RECENCY_HOURS
+from smartvoice import db, ollama_client, processing_control
+from smartvoice.config import CASE_RECENCY_HOURS, api_settings
 from smartvoice.logger import get_logger
 from smartvoice.stt import transcribe_diarized as _transcribe_diarized
 
@@ -1267,6 +1267,12 @@ def _auto_assign_case(call_id: int, analysis: dict) -> None:
       3. **New case** — if no match, create a new case.
     """
     try:
+        call = db.get_call_by_id(call_id)
+        if not call or call["status"] != "done":
+            raise ValueError("analysis_not_done")
+        if call["case_id"] is not None or call["case_link_plan"] is not None or call["case_link_status"] == "failed":
+            db.retry_case_link(call_id)
+            return
         link = db.get_call_customer_link(call_id)
         if not link:
             return  # No customer linked — skip case assignment
@@ -1275,13 +1281,12 @@ def _auto_assign_case(call_id: int, analysis: dict) -> None:
         new_topic = analysis.get("topic", "")
         new_summary = analysis.get("summary", "")
 
-        open_cases = db.get_open_cases_by_customer(customer_id)
+        open_cases = [case for case in db.get_open_cases_by_customer(customer_id) if case.get("call_ids")]
 
         # No open cases → create one directly (no LLM needed)
         if not open_cases:
-            subject = new_topic or new_summary[:60] or "เรื่องทั่วไป"
-            case_id = db.create_case(customer_id, subject)
-            db.assign_call_to_case(call_id, case_id)
+            db.save_case_link_plan(call_id, {"action": "create", "customer_id": customer_id})
+            db.retry_case_link(call_id)
             return
 
         # Enrich cases with: (a) call summaries for LLM context
@@ -1314,26 +1319,33 @@ def _auto_assign_case(call_id: int, analysis: dict) -> None:
                         "(same customer, %.1f min since last call)",
                         call_id, cs["id"], gap / 60.0,
                     )
-                    db.assign_call_to_case(call_id, cs["id"])
-                    db.update_case_status(cs["id"], "follow_up")
+                    db.save_case_link_plan(call_id, {"action": "link", "customer_id": customer_id, "case_id": cs["id"]})
+                    db.retry_case_link(call_id)
                     return
 
         # (2) LLM matching — for cases older than the recency window
-        result = ollama_client.match_case(new_topic, new_summary, open_cases)
+        result = ollama_client.match_case(
+            new_topic, new_summary, open_cases,
+            new_call_at=call_dt.isoformat() if call_dt else None,
+        )
         matched_id = result.get("match_case_id")
         valid_ids = {cs["id"] for cs in open_cases}
         if matched_id and matched_id in valid_ids:
-            db.assign_call_to_case(call_id, matched_id)
-            db.update_case_status(matched_id, "follow_up")
+            db.save_case_link_plan(call_id, {"action": "link", "customer_id": customer_id, "case_id": matched_id})
+            db.retry_case_link(call_id)
             return
 
         # (3) New case
-        subject = result.get("suggested_subject") or new_topic or "เรื่องทั่วไป"
-        case_id = db.create_case(customer_id, subject)
-        db.assign_call_to_case(call_id, case_id)
-    except Exception:
+        db.save_case_link_plan(call_id, {"action": "create", "customer_id": customer_id})
+        db.retry_case_link(call_id)
+    except Exception as exc:
         # Case assignment is non-critical — log but don't break the pipeline
-        log.exception("_auto_assign_case failed for call_id=%s", call_id)
+        log.error("_auto_assign_case failed for call_id=%s (%s)", call_id, type(exc).__name__)
+
+        try:
+            db.record_case_link_failure(call_id)
+        except Exception:
+            log.error("Could not persist case linking failure for call_id=%s", call_id)
 
 
 def process_call(call_id: int, step_callback=None) -> dict:
@@ -1346,14 +1358,24 @@ def process_call(call_id: int, step_callback=None) -> dict:
     _start = time.time()
 
     def _step(msg: str):
+        processing_control.check()
         db.update_processing_step(call_id, msg)
         if step_callback:
             step_callback(msg)
 
+    def _stt_progress(msg: str):
+        # STT reports every load / chunk / diarization stage — stop checkpoints.
+        processing_control.check()
+        if step_callback:
+            step_callback(msg)
+
     try:
-        _step("🎙 [1/4] กำลังถอดเสียงและแยกผู้พูด (WhisperX)...")
+        settings = api_settings()
+        if settings["llm_provider"] == "typhoon" and not settings["typhoon_key"]:
+            raise ollama_client.APIError("Set TYPHOON_API_KEY before processing audio")
+        _step("🎙 [1/4] กำลังถอดเสียงและแยกผู้พูด (Whisper + Pyannote)...")
         raw_segments = _transcribe_diarized(
-            call["file_path"], step_callback=step_callback
+            call["file_path"], step_callback=_stt_progress
         )
 
         MERGE_GAP_SEC = 0.2
@@ -1415,7 +1437,7 @@ def process_call(call_id: int, step_callback=None) -> dict:
         conversation = _drop_adjacent_duplicate_segments(conversation)
 
         _step("🧹 [2/4] กำลังตรวจแก้บทถอดเสียงด้วย AI...")
-        conversation = ollama_client.cleanup_transcript(conversation)
+        conversation = ollama_client.cleanup_transcript(conversation, call_id=call_id, cleanup_pass=1)
         conversation = _sort_conversation(conversation)
         conversation = _split_opening_mixed_turns(conversation)
         conversation = _split_answer_prefixed_turns(conversation)
@@ -1456,7 +1478,7 @@ def process_call(call_id: int, step_callback=None) -> dict:
         conversation = _aggressive_relabel_from_strong_cues(conversation)
         conversation = _merge_adjacent_same_speaker(conversation)
         conversation = _enforce_role_rules(conversation)
-        conversation = ollama_client.cleanup_transcript(conversation)
+        conversation = ollama_client.cleanup_transcript(conversation, call_id=call_id, cleanup_pass=2)
         conversation = _sort_conversation(conversation)
         # Also pre-split long merged segments before the 2nd splitter pass so
         # the splitters (which rely on pattern matching at segment start/end)
@@ -1521,30 +1543,11 @@ def process_call(call_id: int, step_callback=None) -> dict:
         )
 
         _step("💾 กำลังบันทึกผล...")
-        db.update_call_results(
-            call_id=call_id,
-            transcript=transcript,
-            summary=analysis["summary"],
-            sentiment=analysis["sentiment"],
-            topic=analysis["topic"],
-            speaker_mapping=analysis.get("speaker_mapping", ""),
-            agent_performance=analysis.get("agent_performance", ""),
-            keywords=analysis.get("keywords", ""),
-            brand_mentions=analysis.get("brand_mentions", ""),
-            platform_mentions=analysis.get("platform_mentions", ""),
-            anomaly_detected=analysis.get("anomaly_detected", False),
-            anomaly_reason=analysis.get("anomaly_reason", ""),
-            sentiment_reason=analysis.get("sentiment_reason", ""),
-            anomaly_severity=analysis.get("anomaly_severity", ""),
-        )
-
-        # ── Auto Case Assignment ──
-        _step("📂 กำลังจัดกลุ่มเคส...")
-        _auto_assign_case(call_id, analysis)
-
-        elapsed = time.time() - _start
-        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{int(elapsed)}s"
-        _step(f"✅ เสร็จสิ้น ใช้เวลา {elapsed_str}")
+        with processing_control.uninterruptible():
+            _save_results_and_case(call_id, transcript, analysis, _step)
+            elapsed = time.time() - _start
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{int(elapsed)}s"
+            _step(f"✅ เสร็จสิ้น ใช้เวลา {elapsed_str}")
 
         return {
             "call_id": call_id,
@@ -1555,8 +1558,38 @@ def process_call(call_id: int, step_callback=None) -> dict:
             **analysis,
         }
 
+    except processing_control.ProcessingCancelled:
+        log.info("process_call stopped by user for call_id=%s", call_id)
+        db.reset_calls_to_uploaded([call_id])
+        raise
+
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        log.exception("process_call failed for call_id=%s", call_id)
+        log.error("process_call failed for call_id=%s (%s)", call_id, type(exc).__name__)
         db.update_call_status(call_id, "error", error_msg=error_msg)
         raise
+
+
+def _save_results_and_case(call_id: int, transcript: str, analysis: dict, step) -> None:
+    """Write the analysis and attach the call to a case — one unit, never stopped halfway."""
+    db.update_call_results(
+        call_id=call_id,
+        transcript=transcript,
+        summary=analysis["summary"],
+        sentiment=analysis["sentiment"],
+        topic=analysis["topic"],
+        speaker_mapping=analysis.get("speaker_mapping", ""),
+        agent_performance=analysis.get("agent_performance", ""),
+        keywords=analysis.get("keywords", ""),
+        brand_mentions=analysis.get("brand_mentions", ""),
+        platform_mentions=analysis.get("platform_mentions", ""),
+        anomaly_detected=analysis.get("anomaly_detected", False),
+        anomaly_reason=analysis.get("anomaly_reason", ""),
+        sentiment_reason=analysis.get("sentiment_reason", ""),
+        anomaly_severity=analysis.get("anomaly_severity", ""),
+        topic_detail=analysis.get("topic_detail", ""),
+    )
+
+    # ── Auto Case Assignment ──
+    step("📂 กำลังจัดกลุ่มเคส...")
+    _auto_assign_case(call_id, analysis)

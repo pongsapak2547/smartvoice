@@ -17,7 +17,7 @@ if command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
     PY_CMD="python"
 else
-    echo "Python was not found. Install Python 3.10 or 3.11 first."
+    echo "Python was not found. Install Python 3.10, 3.11 or 3.12 first."
     exit 1
 fi
 
@@ -41,15 +41,6 @@ echo "Installing SmartVoice dependencies. This can take a while on first run..."
 
 echo "Installing SmartVoice package..."
 "$VENV_PY" -m pip install -e . --no-deps
-
-if command -v ollama >/dev/null 2>&1; then
-    echo "Starting Ollama in the background if it is not already running..."
-    ollama serve >/tmp/smartvoice-ollama.log 2>&1 &
-else
-    echo
-    echo "NOTE: Ollama is not installed or not in PATH."
-    echo "Install Ollama from https://ollama.com for real LLM analysis."
-fi
 
 echo
 echo "Opening SmartVoice at http://localhost:${PORT:-8501}"

@@ -64,17 +64,13 @@ def mask_secret(value: str, visible: int = 6) -> str:
 
 
 DEMO_PRESET = {
+    "STT_PROVIDER": "pyannote_api",
+    "LLM_PROVIDER": "typhoon",
     "MOCK_STT": "true",
-    "WHISPER_DEVICE": "cpu",
-    "WHISPER_COMPUTE": "int8",
 }
 
 REAL_AI_PRESET = {
+    "STT_PROVIDER": "pyannote_api",
+    "LLM_PROVIDER": "typhoon",
     "MOCK_STT": "false",
-    "WHISPER_BACKEND": "transformers",
-    "WHISPER_MODEL": "biodatlab/distill-whisper-th-large-v3",
-    "WHISPER_DEVICE": "auto",
-    "WHISPER_COMPUTE": "auto",
-    "OLLAMA_BASE_URL": "http://localhost:11434",
-    "OLLAMA_MODEL": "scb10x/llama3.1-typhoon2-8b-instruct",
 }

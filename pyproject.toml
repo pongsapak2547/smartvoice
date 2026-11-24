@@ -9,19 +9,15 @@ description = "AI-powered Call Center Analytics — Thai STT, diarization, and L
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "streamlit",
-    "python-dotenv",
-    "pandas",
-    "plotly",
-    "requests",
-    "faster-whisper",
-    "transformers",
-    "torch",
-    "pyannote.audio",
-    "soundfile",
-    "noisereduce",
-    "scipy",
-    "huggingface_hub",
+    "streamlit==1.55.0",
+    "plotly>=6.0.0,<7.0.0",
+    "pandas>=2.3.0,<3.0.0",
+    "matplotlib>=3.10.0,<4.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+    "fpdf2>=2.8.0,<3.0.0",
+    "uharfbuzz>=0.39.0",
+    "python-dotenv>=1.2.0,<2.0.0",
+    "requests>=2.32.0,<3.0.0",
 ]
 
 [project.scripts]

@@ -30,9 +30,14 @@ class PipelineDBTestCase(unittest.TestCase):
         except OSError:
             pass
 
+    def _insert_done_call(self, *args):
+        call_id = db.insert_call(*args)
+        db.update_call_results(call_id, "synthetic", "synthetic", "neutral", "สอบถามข้อมูลสินค้า")
+        return call_id
+
     def _setup_customer_with_call(self, phone="0819879336"):
         cid = db.insert_customer(first_name="x", last_name="y", phone=phone)
-        call_id = db.insert_call("a.wav", "ha", "/a.wav")
+        call_id = self._insert_done_call("a.wav", "ha", "/a.wav")
         db.link_call_customer(call_id=call_id, customer_id=cid, matched_by="auto_phone")
         return cid, call_id
 
@@ -49,7 +54,7 @@ class TestRecencyShortCircuit(PipelineDBTestCase):
         case_id = call1_row["case_id"]
 
         # Second call 18 min later, DIFFERENT topic — should still merge via recency
-        call2 = db.insert_call("b.wav", "hb", "/b.wav")
+        call2 = self._insert_done_call("b.wav", "hb", "/b.wav")
         db.link_call_customer(call_id=call2, customer_id=cid, matched_by="auto_phone")
 
         # Mock ollama — must NOT be called
@@ -65,7 +70,7 @@ class TestRecencyShortCircuit(PipelineDBTestCase):
 
     def test_filename_call_datetime_prevents_false_recent_merge(self):
         cid = db.insert_customer(first_name="x", last_name="y", phone="0819879336")
-        call1 = db.insert_call(
+        call1 = self._insert_done_call(
             "20260101090000-0819879336-104-Inbound.wav",
             "ha",
             "/a.wav",
@@ -74,7 +79,7 @@ class TestRecencyShortCircuit(PipelineDBTestCase):
         pipeline._auto_assign_case(call1, {"topic": "สอบถามการจัดส่ง", "summary": "s1"})
         old_case = db.get_call_by_id(call1)["case_id"]
 
-        call2 = db.insert_call(
+        call2 = self._insert_done_call(
             "20260110100000-0819879336-104-Inbound.wav",
             "hb",
             "/b.wav",
@@ -107,7 +112,7 @@ class TestRecencyShortCircuit(PipelineDBTestCase):
             )
         conn.close()
 
-        call2 = db.insert_call("b.wav", "hb", "/b.wav")
+        call2 = self._insert_done_call("b.wav", "hb", "/b.wav")
         db.link_call_customer(call_id=call2, customer_id=cid, matched_by="auto_phone")
 
         # LLM says "new case"
@@ -126,7 +131,7 @@ class TestRecencyShortCircuit(PipelineDBTestCase):
 
 class TestNoCustomerLink(PipelineDBTestCase):
     def test_no_link_skips_case_assignment(self):
-        call_id = db.insert_call("nolink.wav", "h", "/n.wav")
+        call_id = self._insert_done_call("nolink.wav", "h", "/n.wav")
         pipeline._auto_assign_case(call_id, {"topic": "X", "summary": "s"})
         row = db.get_call_by_id(call_id)
         self.assertIsNone(row["case_id"])

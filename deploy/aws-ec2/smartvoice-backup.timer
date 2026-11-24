@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the SmartVoice backup every night (02:30 Bangkok time)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Bangkok
+# A stopped instance (e.g. AWS Academy lab session ended) catches up at boot.
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

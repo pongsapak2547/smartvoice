@@ -1,0 +1,907 @@
+
+import streamlit as st
+
+st.set_page_config(page_title="SmartVoice — อัปโหลดและประมวลผลเสียง", layout="wide")
+
+from smartvoice import audit as audit_trail
+from smartvoice import case_workflow, db, file_manager, labels, processing_control
+from smartvoice.auth import PAGE_ADMIN, role_label
+from smartvoice.file_manager import extract_direction_from_filename
+from smartvoice.preflight import get_llm_readiness, get_pyannote_access_readiness
+from smartvoice.ui_helpers import (
+    audit,
+    current_case_actor,
+    init_page,
+    launch_processing,
+    launch_processing_queue,
+    metric_card,
+    render_case_ownership,
+    render_case_link_status,
+    retry_case_link_for_current_user,
+    render_transcript,
+    status_badge,
+)
+
+# Admin/Supervisor only — Agent and QA never see this page in the sidebar, and
+# this guard also blocks a hand-typed /admin URL.
+_current_user, _current_role = init_page(PAGE_ADMIN)
+
+# ─────────────────────────────────────────
+# PAGE: ADMIN — Upload & Process
+# ─────────────────────────────────────────
+st.title("อัปโหลดและประมวลผลเสียง")
+
+st.caption(
+    "ขั้นตอน: 1) อัปโหลดไฟล์เสียง → 2) กดประมวลผล ระบบจะถอดเสียง สรุปเรื่อง และสร้างเคสให้เอง "
+    f"→ 3) ตรวจผลรายไฟล์ด้านล่าง  •  ผู้ใช้: **{_current_user}** ({role_label(_current_role)})"
+)
+
+
+def _flash(kind: str, message: str) -> None:
+    """Keep a message across st.rerun() — otherwise it vanishes before anyone reads it."""
+    st.session_state["_admin_flash"] = (kind, message)
+
+
+_pending_flash = st.session_state.pop("_admin_flash", None)
+if _pending_flash:
+    getattr(st, _pending_flash[0])(_pending_flash[1])
+
+
+def _delete_calls(calls: list[dict], bulk: bool) -> tuple[int, list[str]]:
+    """Remove the audio files and DB rows of `calls`; returns (deleted, files we couldn't remove).
+
+    A file that can't be removed (open in another program, already gone) must not
+    stop the rest — the row is still deleted and the user is told which file to
+    clean up by hand.
+    """
+    stuck = [c["filename"] for c in calls if not file_manager.remove_audio_file(c.get("file_path"))]
+    db.delete_calls_bulk([c["id"] for c in calls])
+    for call in calls:
+        audit(
+            audit_trail.DELETE,
+            audit_trail.ENTITY_CALL,
+            entity_id=call["id"],
+            entity_label=call["filename"],
+            changes={"status": call["status"], "bulk": bulk} if bulk else {"status": call["status"]},
+        )
+    for call in calls:
+        st.session_state.get("selected_calls", set()).discard(call["id"])
+        st.session_state.pop(f"chk_{call['id']}", None)
+    return len(calls), stuck
+
+
+@st.dialog("ยืนยันการลบไฟล์เสียง")
+def _confirm_delete_dialog(calls: list[dict], bulk: bool) -> None:
+    st.warning(
+        f"จะลบ **{len(calls)} ไฟล์** พร้อมผลวิเคราะห์ของไฟล์เหล่านี้ — **ลบแล้วกู้คืนไม่ได้**"
+    )
+    for call in calls[:8]:
+        st.caption(f"- {call['filename']}")
+    if len(calls) > 8:
+        st.caption(f"และอีก {len(calls) - 8} ไฟล์")
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("ลบถาวร", type="primary", use_container_width=True):
+        deleted, stuck = _delete_calls(calls, bulk)
+        if stuck:
+            _flash(
+                "warning",
+                f"ลบข้อมูล {deleted} ไฟล์แล้ว แต่ลบไฟล์เสียงในเครื่องไม่ได้ {len(stuck)} ไฟล์ "
+                f"(อาจถูกเปิดอยู่): {', '.join(stuck)}",
+            )
+        else:
+            _flash("success", f"ลบ {deleted} ไฟล์เรียบร้อยแล้ว")
+        st.rerun()
+    if no_col.button("ยกเลิก", use_container_width=True):
+        st.rerun()
+
+
+@st.dialog("ยืนยันการรวมเคส")
+def _confirm_merge_dialog(src: dict, dst_id: int, dst_label: str) -> None:
+    st.write(
+        f"ย้ายสายทั้งหมดจาก **เคส #{src['id']}: {src['subject']}** ไปไว้ที่ **{dst_label}** "
+        f"แล้วลบเคส #{src['id']} ทิ้ง"
+    )
+    st.caption("ทำแล้วย้อนกลับไม่ได้")
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("รวมเคส", type="primary", use_container_width=True):
+        moved = db.merge_cases(src["id"], dst_id)
+        audit(
+            audit_trail.DELETE,
+            audit_trail.ENTITY_CASE,
+            entity_id=src["id"],
+            entity_label=src["subject"],
+            changes={"merged_into_case_id": dst_id, "moved_calls": moved},
+        )
+        _flash("success", f"ย้าย {moved} สายไปเคส #{dst_id} และลบเคส #{src['id']} แล้ว")
+        st.rerun()
+    if no_col.button("ยกเลิก", use_container_width=True):
+        st.rerun()
+
+# Upload section
+st.subheader("1. อัปโหลดไฟล์เสียง")
+uploaded_files = st.file_uploader(
+    "ลากไฟล์ .wav หรือ .mp3 มาวางที่นี่",
+    type=["wav", "mp3"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    upload_key = tuple(sorted(uf.name for uf in uploaded_files))
+    if st.session_state.get("_last_upload_key") != upload_key:
+        st.session_state["_last_upload_key"] = upload_key
+        for uf in uploaded_files:
+            file_bytes = uf.read()
+            safe_name = file_manager.sanitize_filename(uf.name)
+
+            is_valid, err_msg = file_manager.validate_upload(file_bytes, safe_name)
+            if not is_valid:
+                st.warning(f"`{safe_name}` — {err_msg}")
+                continue
+
+            file_hash = file_manager.compute_file_hash(file_bytes)
+
+            existing = db.get_call_by_hash(file_hash)
+            if existing:
+                if existing["status"] == "error":
+                    db.update_call_status(existing["id"], "uploaded", error_msg=None)
+                    db.update_processing_step(existing["id"], None)
+                    st.warning(f"`{safe_name}` มีอยู่แล้ว (สถานะ: ผิดพลาด) — ตั้งกลับเป็นรอประมวลผลแล้ว")
+                else:
+                    st.info(f"`{safe_name}` มีอยู่แล้ว (ไฟล์ซ้ำ) — ข้ามไฟล์นี้")
+                continue
+
+            saved_path = file_manager.save_audio_file(file_bytes, safe_name, file_hash)
+            call_id = db.insert_call(
+                safe_name, file_hash, saved_path,
+                uploaded_by=_current_user,
+                uploaded_by_role=_current_role,
+            )
+            audit(
+                audit_trail.CREATE,
+                audit_trail.ENTITY_CALL,
+                entity_id=call_id,
+                entity_label=safe_name,
+                changes={"file_hash": file_hash, "size_mb": round(len(file_bytes) / 1048576, 2)},
+            )
+
+            # Auto-link by phone number in filename
+            phone = file_manager.extract_phone_from_filename(safe_name)
+            if phone:
+                db.update_call_customer_phone(call_id, phone)
+                link_info = db.auto_link_call_by_phone(call_id, phone)
+                if link_info:
+                    st.success(
+                        f"อัปโหลด `{safe_name}` แล้ว — เชื่อมอัตโนมัติกับ "
+                        f"**{link_info['customer_name']}** (เบอร์ {phone})"
+                        + (f" + ทะเบียนรับประกัน #{link_info['warranty_id']}" if link_info['warranty_id'] else "")
+                    )
+                else:
+                    st.success(f"อัปโหลด `{safe_name}` แล้ว — เบอร์ `{phone}` (ไม่พบลูกค้าในระบบ)")
+            else:
+                st.success(f"อัปโหลด `{safe_name}` และบันทึกเข้าระบบแล้ว")
+
+st.divider()
+
+# Processing section
+st.subheader("2. ประมวลผลสาย")
+
+# ── Scale-friendly counts: SQL aggregate so it stays fast at 10K+ rows ─────
+# (the Admin list below is capped to "latest N" via a user picker — these
+#  counts always reflect the WHOLE table, not the capped subset)
+_counts = db.count_calls_by_status()
+llm_ready, llm_detail = get_llm_readiness()
+processing_blocked = not llm_ready
+speech_ready, speech_detail = get_pyannote_access_readiness()
+processing_blocked = processing_blocked or not speech_ready
+if not speech_ready:
+    st.warning(f"บริการเสียง API ยังไม่พร้อม ({speech_detail}) — ตรวจการตั้งค่า API")
+
+if not llm_ready:
+    st.error(
+        "ยังประมวลผลไม่ได้ เพราะบริการวิเคราะห์ข้อความยังไม่พร้อม "
+        f"({llm_detail})"
+    )
+    st.markdown("**วิธีเตรียมบริการวิเคราะห์ข้อความ**")
+    st.markdown("ตั้งค่า TYPHOON_API_KEY และ TYPHOON_MODEL ในหน้าตั้งค่า แล้วเปิดโปรแกรมใหม่")
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown(metric_card(_counts["uploaded"], "รอประมวลผล"), unsafe_allow_html=True)
+with col2:
+    st.markdown(metric_card(_counts["processing"], "กำลังประมวลผล"), unsafe_allow_html=True)
+with col3:
+    st.markdown(metric_card(_counts["done"], "เสร็จแล้ว"), unsafe_allow_html=True)
+with col4:
+    st.markdown(metric_card(_counts["error"], "ผิดพลาด"), unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+col_a, col_b = st.columns([1, 3])
+with col_a:
+    process_all_btn = st.button(
+        "ประมวลผลทั้งหมดที่รออยู่",
+        disabled=_counts["uploaded"] == 0 or processing_blocked,
+        use_container_width=True,
+        type="primary",
+    )
+with col_b:
+    if _counts["uploaded"] == 0:
+        st.info("ไม่มีสายที่รอประมวลผล")
+
+if process_all_btn and _counts["uploaded"] > 0:
+    # Lazy fetch — only the IDs we need, and only when the button is clicked
+    pending_ids = db.get_pending_call_ids()
+    queued = launch_processing_queue(pending_ids)
+    if "just_launched" not in st.session_state:
+        st.session_state.just_launched = set()
+    st.session_state.just_launched.update(queued or [])
+    st.rerun()
+
+
+def _render_live_result(call_id: int) -> None:
+    """Result of one finished call, readable while the rest of the run continues."""
+    call = db.get_call_by_id(call_id)
+    if not call:
+        st.caption("ไม่พบสายนี้แล้ว — อาจถูกลบไป")
+        return
+    if call["status"] == "error":
+        st.error(
+            "ไฟล์นี้ประมวลผลไม่สำเร็จ — กด *ประมวลผล* ที่ไฟล์นี้ในรายการด้านล่างเพื่อลองใหม่  \n"
+            f"รายละเอียด: {(call.get('error_msg') or '-').splitlines()[0]}"
+        )
+        return
+    st.caption(
+        f"เรื่อง: {call.get('topic_detail') or call.get('topic') or '-'}  •  "
+        f"อารมณ์ลูกค้า: {labels.sentiment(call.get('sentiment'))}"
+    )
+    if call.get("anomaly_detected"):
+        (st.error if call.get("anomaly_severity") == "high" else st.warning)(
+            f"ความผิดปกติ ({labels.severity(call.get('anomaly_severity'))}): "
+            f"{call.get('anomaly_reason') or 'ไม่ระบุสาเหตุ'}"
+        )
+    st.markdown("**สรุปสาย**")
+    st.write(call.get("summary") or "ยังไม่มีสรุป")
+    if call.get("sentiment_reason"):
+        st.caption(f"เหตุผลที่ประเมินอารมณ์ลูกค้า: {call['sentiment_reason']}")
+    with st.expander("บทสนทนาแยกผู้พูด"):
+        render_transcript(call)
+    st.page_link(
+        "pages/12_Call_Summaries.py",
+        label="ดูรายละเอียดเต็ม (สิ่งที่ต้องทำต่อ คะแนนพนักงาน) ที่หน้ารายการสาย",
+        icon=":material/open_in_new:",
+    )
+
+
+def _remember_live_pick() -> None:
+    st.session_state["_live_pick_id"] = st.session_state.get("_live_pick")
+
+
+@st.fragment(run_every=3)
+def _live_run_panel():
+    """Progress of the current run, its stop button, and each result as soon as it is ready.
+
+    Re-drawn every 3 s on its own; the whole page reruns only when another
+    call finishes, so the counters and the call list below catch up too.
+    """
+    run_ids = processing_control.run_call_ids()
+    running = processing_control.is_running()
+    # A stopped run ends without another call finishing — rerun once so the
+    # counters and the list stop showing those calls as in progress.
+    was_running = st.session_state.get("_live_was_running", False)
+    st.session_state["_live_was_running"] = running
+    if was_running and not running:
+        st.rerun()
+
+    if not running:
+        # Nothing runs in this server, so any 'processing' row was left behind
+        # by a stop or crash (the app closed mid-call) — offer to requeue it now
+        # instead of waiting for the stale-processing recovery hours later.
+        stuck = db.get_processing_calls()
+        if stuck:
+            st_col1, st_col2 = st.columns([3, 1])
+            with st_col1:
+                st.warning(
+                    f"มี {len(stuck)} ไฟล์ค้างสถานะ \"กำลังประมวลผล\" แต่ไม่มีงานรันอยู่ "
+                    "(เช่น ปิดโปรแกรมระหว่างประมวลผล) — คืนสถานะเป็นรอประมวลผลเพื่อสั่งใหม่ได้"
+                )
+            with st_col2:
+                if st.button("คืนสถานะไฟล์ที่ค้าง", use_container_width=True):
+                    reset = db.reset_calls_to_uploaded([c["id"] for c in stuck])
+                    audit(
+                        audit_trail.UPDATE,
+                        audit_trail.ENTITY_CALL,
+                        entity_label="คืนสถานะไฟล์ที่ค้างการประมวลผล",
+                        changes={"status": ["processing", "uploaded"], "files": reset},
+                    )
+                    _flash("success", f"คืนสถานะ {reset} ไฟล์เป็นรอประมวลผลแล้ว")
+                    st.rerun()
+
+    if not run_ids:
+        return
+
+    rows = db.get_calls_progress(run_ids)
+    finished = [r for r in rows if r["status"] in ("done", "error")]
+    finished_ids = {r["id"] for r in finished}
+    seen = st.session_state.get("_live_finished_seen")
+    st.session_state["_live_finished_seen"] = finished_ids
+    if seen is not None and finished_ids - seen:
+        st.rerun()
+
+    # The queue marks every call 'processing' up front but runs them one by
+    # one in queue order — only the first is actually being worked on.
+    current = next((r for r in rows if r["status"] == "processing"), None) if running else None
+
+    def _row_status(r: dict) -> str:
+        if r["status"] == "processing" and r is not current:
+            return "รอคิว"
+        return labels.call_status(r["status"])
+
+    with st.container(border=True):
+        if running:
+            st.progress(
+                len(finished) / len(rows) if rows else 0.0,
+                text=f"ประมวลผลแล้ว {len(finished)} / {len(rows)} ไฟล์",
+            )
+            if current:
+                st.info(
+                    f"กำลังประมวลผล `{current['filename']}`\n\n"
+                    f"**ขั้นตอนปัจจุบัน:** {current.get('processing_step') or 'กำลังเริ่มต้น...'}"
+                )
+            if processing_control.stop_requested():
+                st.warning(
+                    "กำลังหยุด — รอให้ขั้นตอนที่ทำอยู่จบก่อน (ไม่เกินหนึ่งช่วงเสียงหรือหนึ่งคำขอ AI) "
+                    "ไฟล์ที่ยังไม่เสร็จจะกลับเป็น \"รอประมวลผล\""
+                )
+            elif st.button("หยุดประมวลผล", type="secondary", icon=":material/stop_circle:"):
+                if processing_control.request_stop():
+                    pending = len(rows) - len(finished)
+                    audit(
+                        audit_trail.CANCEL,
+                        audit_trail.ENTITY_CALL,
+                        entity_label="หยุดประมวลผล",
+                        changes={"finished": len(finished), "not_finished": pending},
+                    )
+                    st.toast("ส่งคำสั่งหยุดแล้ว")
+                st.rerun(scope="fragment")
+        else:
+            done_n = sum(1 for r in rows if r["status"] == "done")
+            error_n = sum(1 for r in rows if r["status"] == "error")
+            left_n = len(rows) - done_n - error_n
+            sum_col, close_col = st.columns([3, 1])
+            with sum_col:
+                st.markdown(
+                    f"**รอบล่าสุด:** เสร็จ {done_n} ไฟล์  •  ผิดพลาด {error_n} ไฟล์"
+                    + (f"  •  ยังไม่ได้ประมวลผล {left_n} ไฟล์ (หยุดกลางคัน)" if left_n else "")
+                )
+            with close_col:
+                if st.button("ปิดรายการนี้", use_container_width=True):
+                    processing_control.clear_run()
+                    st.session_state.pop("_live_finished_seen", None)
+                    st.rerun()
+
+        st.dataframe(
+            [
+                {
+                    "สถานะ": _row_status(r),
+                    "ไฟล์": r["filename"],
+                    "เรื่อง": r.get("topic_detail") or r.get("topic") or "",
+                    "อารมณ์ลูกค้า": labels.sentiment(r.get("sentiment")) if r["status"] == "done" else "",
+                    "ความผิดปกติ": labels.severity(r.get("anomaly_severity"))
+                    if r.get("anomaly_detected") else "",
+                }
+                for r in rows
+            ],
+            hide_index=True,
+            width="stretch",
+            # CDR filenames are ~60 characters; at full width they push the
+            # result columns off screen.
+            column_config={
+                "สถานะ": st.column_config.TextColumn(width="small"),
+                "ไฟล์": st.column_config.TextColumn(width="medium"),
+            },
+        )
+
+        if finished:
+            # Options only grow during a run (in queue order), and the pick is
+            # kept in a plain key — so a call finishing never swaps what you read.
+            options = [r["id"] for r in finished]
+            names = {r["id"]: r["filename"] for r in finished}
+            remembered = st.session_state.get("_live_pick_id")
+            if remembered not in options:
+                remembered = options[-1]
+            st.selectbox(
+                "เปิดอ่านผลของไฟล์ที่เสร็จแล้ว",
+                options,
+                index=options.index(remembered),
+                format_func=lambda cid: names.get(cid, str(cid)),
+                key="_live_pick",
+                on_change=_remember_live_pick,
+            )
+            st.session_state["_live_pick_id"] = st.session_state.get("_live_pick", remembered)
+            _render_live_result(st.session_state["_live_pick_id"])
+        elif running:
+            st.caption("ผลของแต่ละไฟล์จะขึ้นที่นี่ทันทีที่ไฟล์นั้นเสร็จ ไม่ต้องรอให้ครบทุกไฟล์")
+
+
+_live_run_panel()
+
+# ── Orphan case cleanup ──
+_orphan_count = db.count_orphan_cases()
+if _orphan_count > 0:
+    orph_col1, orph_col2 = st.columns([1, 3])
+    with orph_col1:
+        if st.button(
+            f"ล้างเคสค้าง ({_orphan_count})",
+            use_container_width=True,
+            help="ลบเคสที่ไม่มีสายชี้มา (เกิดจากการลบไฟล์เสียงก่อนหน้า)",
+        ):
+            removed = db.delete_orphan_cases()
+            _flash("success", f"ล้างเคสว่าง {removed} เคสเรียบร้อยแล้ว")
+            st.rerun()
+    with orph_col2:
+        st.caption(f"มี {_orphan_count} เคสที่ไม่เหลือสายแล้ว (เพราะไฟล์เสียงถูกลบ) — กดปุ่มซ้ายเพื่อล้างออก")
+
+st.divider()
+
+# Individual call actions
+st.subheader("3. จัดการสายรายไฟล์")
+if _counts["total"] == 0:
+    st.caption("ยังไม่มีสายที่อัปโหลดเข้ามา")
+else:
+    # ── Load-limit picker (ops-focused: usually browsing recent uploads) ──
+    # บริษัทมีไฟล์เสียงเป็นหมื่นๆ ไฟล์ — โหลดทั้งหมดทุกครั้งจะหน่วงระบบ
+    _ADMIN_LIMIT_OPTIONS = {
+        "100 สายล่าสุด": 100,
+        "200 สายล่าสุด": 200,
+        "500 สายล่าสุด": 500,
+        "1,000 สายล่าสุด": 1000,
+        "5,000 สายล่าสุด": 5000,
+        "ทั้งหมด (อาจช้าเมื่อข้อมูลเยอะ)": None,
+    }
+    # Default — ops users mostly look at recent uploads, so a tighter default
+    # keeps the page snappy. 200 latest ≈ 10 pages of pagination (PAGE_SIZE=20),
+    # enough for a normal browsing session.
+    _default_admin_limit = (
+        "ทั้งหมด (อาจช้าเมื่อข้อมูลเยอะ)" if _counts["total"] <= 200 else "200 สายล่าสุด"
+    )
+    if "_admin_load_limit" not in st.session_state:
+        st.session_state["_admin_load_limit"] = _default_admin_limit
+
+    lim_col1, lim_col2 = st.columns([1, 3])
+    with lim_col1:
+        st.selectbox(
+            "ขอบเขตการโหลด",
+            list(_ADMIN_LIMIT_OPTIONS.keys()),
+            key="_admin_load_limit",
+            help="จำกัดจำนวนสายที่โหลดเข้ามาแสดง เพื่อให้หน้านี้เปิดเร็วเมื่อมีไฟล์เยอะมาก",
+        )
+    _admin_limit = _ADMIN_LIMIT_OPTIONS.get(st.session_state["_admin_load_limit"])
+    with lim_col2:
+        if _admin_limit is not None and _counts["total"] > _admin_limit:
+            st.caption(
+                f"โหลด {_admin_limit:,} สายล่าสุดจากทั้งหมด {_counts['total']:,} สาย"
+                "  •  ถ้าต้องค้นสายเก่ากว่านี้ ให้ขยายขอบเขตด้านซ้าย"
+            )
+
+    refresh_calls = db.get_all_calls(limit=_admin_limit)
+
+    # Clean up `just_launched` — remove ids whose status has moved past
+    # 'processing'. Use the same loaded subset (newest calls are the most
+    # likely candidates; older just_launched ids are rare and will self-clear
+    # on the next refresh when their status changes).
+    if "just_launched" in st.session_state and not processing_control.is_running():
+        # Nothing runs (finished, stopped, or never started because Ollama was
+        # down) — a call stopped mid-run is 'uploaded' again, not in progress.
+        st.session_state.just_launched = set()
+    elif "just_launched" in st.session_state:
+        _active_db_statuses = {c["id"]: c["status"] for c in refresh_calls}
+        st.session_state.just_launched = {
+            cid for cid in st.session_state.just_launched
+            if _active_db_statuses.get(cid) in ("uploaded", "processing")
+        }
+
+    if "selected_calls" not in st.session_state:
+        st.session_state.selected_calls = set()
+
+    # ── Toolbar: search + status filter + sort ────────────────────────────
+    tbar_search, tbar_status, tbar_sort = st.columns([2, 2, 1])
+    with tbar_search:
+        q = st.text_input(
+            "ค้นหา",
+            key="_call_search",
+            placeholder="ชื่อไฟล์ / เบอร์ / ผู้อัพโหลด",
+            label_visibility="collapsed",
+        ).strip().lower()
+    with tbar_status:
+        status_filter = st.radio(
+            "สถานะ",
+            ["ทั้งหมด", "รอประมวลผล", "กำลังประมวลผล", "เสร็จแล้ว", "ผิดพลาด"],
+            horizontal=True,
+            key="_call_status_filter",
+            label_visibility="collapsed",
+        )
+    with tbar_sort:
+        sort_mode = st.selectbox(
+            "เรียง",
+            ["ใหม่ → เก่า", "เก่า → ใหม่", "ตามสถานะ"],
+            key="_call_sort_mode",
+            label_visibility="collapsed",
+        )
+
+    # Direction filter — derived from filename suffix (-Inbound.wav / -Outbound.wav).
+    # Omazz CDR system tags every file this way; no DB column needed.
+    direction_filter = st.radio(
+        "ทิศทางสาย",
+        ["ทั้งหมด", "สายเข้า (Inbound)", "สายออก (Outbound)"],
+        horizontal=True,
+        key="_call_direction_filter",
+        label_visibility="collapsed",
+    )
+
+    # Apply filter
+    _status_map = {
+        "รอประมวลผล": "uploaded", "กำลังประมวลผล": "processing",
+        "เสร็จแล้ว": "done", "ผิดพลาด": "error",
+    }
+    _direction_map = {
+        "สายเข้า (Inbound)": "inbound",
+        "สายออก (Outbound)": "outbound",
+    }
+    filtered_calls = refresh_calls
+    if status_filter != "ทั้งหมด":
+        want = _status_map[status_filter]
+        filtered_calls = [c for c in filtered_calls if c["status"] == want]
+    if direction_filter != "ทั้งหมด":
+        want_dir = _direction_map[direction_filter]
+        filtered_calls = [
+            c for c in filtered_calls
+            if extract_direction_from_filename(c.get("filename", "")) == want_dir
+        ]
+    if q:
+        def _match(c):
+            hay = " ".join([
+                c.get("filename", "") or "",
+                c.get("customer_phone", "") or "",
+                c.get("uploaded_by", "") or "",
+            ]).lower()
+            return q in hay
+        filtered_calls = [c for c in filtered_calls if _match(c)]
+
+    # Apply sort
+    if sort_mode == "ใหม่ → เก่า":
+        filtered_calls = sorted(filtered_calls, key=lambda c: c.get("created_at") or "", reverse=True)
+    elif sort_mode == "เก่า → ใหม่":
+        filtered_calls = sorted(filtered_calls, key=lambda c: c.get("created_at") or "")
+    else:  # ตามสถานะ
+        _status_order = {"error": 0, "processing": 1, "uploaded": 2, "done": 3}
+        filtered_calls = sorted(
+            filtered_calls,
+            key=lambda c: (_status_order.get(c["status"], 9), c.get("created_at") or ""),
+        )
+
+    # Keep selected_calls in sync with checkbox state (scoped to filtered view)
+    st.session_state.selected_calls = {
+        c["id"] for c in filtered_calls
+        if st.session_state.get(f"chk_{c['id']}", False)
+    }
+
+    # Result summary
+    st.caption(
+        f"พบ **{len(filtered_calls)}** / {len(refresh_calls)} ไฟล์"
+        + (f"  •  `{q}`" if q else "")
+        + (f"  •  สถานะ: **{status_filter}**" if status_filter != "ทั้งหมด" else "")
+        + (f"  •  ทิศทาง: **{direction_filter}**" if direction_filter != "ทั้งหมด" else "")
+    )
+
+    # ── Bulk actions ──────────────────────────────────────────────────────
+    bulk_col1, bulk_col2, bulk_col3 = st.columns([1, 1, 2])
+    with bulk_col1:
+        if st.button("เลือกทั้งหมด (ที่กรองอยู่)", use_container_width=True):
+            st.session_state.selected_calls = {c["id"] for c in filtered_calls}
+            for c in filtered_calls:
+                st.session_state[f"chk_{c['id']}"] = True
+            st.rerun()
+    with bulk_col2:
+        if st.button("ยกเลิกการเลือกทั้งหมด", use_container_width=True):
+            st.session_state.selected_calls = set()
+            for c in refresh_calls:
+                st.session_state[f"chk_{c['id']}"] = False
+            st.rerun()
+    with bulk_col3:
+        selected_count = len(st.session_state.selected_calls)
+        delete_selected_btn = st.button(
+            f"ลบที่เลือกไว้ ({selected_count})",
+            disabled=selected_count == 0,
+            use_container_width=True,
+            type="secondary",
+        )
+
+    if delete_selected_btn and st.session_state.selected_calls:
+        _confirm_delete_dialog(
+            [c for c in refresh_calls if c["id"] in st.session_state.selected_calls], bulk=True
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Pagination ────────────────────────────────────────────────────────
+    PAGE_SIZE = 20
+    # Reset page size when search/filter/sort changes, so users aren't stuck
+    # seeing a stale "Load more" count after narrowing the list.
+    _filter_key = (q, status_filter, direction_filter, sort_mode)
+    if st.session_state.get("_call_filter_key") != _filter_key:
+        st.session_state._call_filter_key = _filter_key
+        st.session_state._call_page_size = PAGE_SIZE
+    if "_call_page_size" not in st.session_state:
+        st.session_state._call_page_size = PAGE_SIZE
+    visible_calls = filtered_calls[: st.session_state._call_page_size]
+
+    # Helper: shrink long filenames with middle ellipsis (keeps head + tail)
+    def _shrink_name(name: str, head: int = 22, tail: int = 18) -> str:
+        if len(name) <= head + tail + 1:
+            return name
+        return f"{name[:head]}…{name[-tail:]}"
+
+    # Status word for the expander title — no icons: the label has to read the
+    # same as the status filter above it.
+    _st_label = {
+        "uploaded": "รอประมวลผล", "processing": "กำลังประมวลผล",
+        "done": "เสร็จแล้ว", "error": "ผิดพลาด",
+    }
+
+    for call in visible_calls:
+        _eff_st = call["status"]
+        if call["id"] in st.session_state.get("just_launched", set()):
+            _eff_st = "processing"
+        _phone = call.get("customer_phone") or ""
+        _phone_tag = f"  •  เบอร์: {_phone}" if _phone else ""
+        _date_short = labels.thai_time(call.get("created_at"), with_time=False)
+        _uploader_short = call.get("uploaded_by") or "—"
+        _hdr_name = _shrink_name(call["filename"])
+        _hdr = (
+            f"{_hdr_name}  —  {_st_label.get(_eff_st, _eff_st)}"
+            f"{_phone_tag}  •  อัปโหลด {_date_short} โดย {_uploader_short}"
+        )
+        with st.expander(_hdr):
+            chk_col, info_col, action_col = st.columns([0.3, 2, 1])
+            with chk_col:
+                st.checkbox(
+                    "เลือก",
+                    key=f"chk_{call['id']}",
+                    label_visibility="collapsed",
+                )
+
+            with info_col:
+                st.markdown(f"**ไฟล์:** {call['filename']}")
+                if _phone:
+                    st.markdown(f"**เบอร์ลูกค้า (จากชื่อไฟล์):** `{_phone}`")
+                _uploaded_ts = labels.thai_time(call.get("created_at"))
+                _uploader = call.get('uploaded_by') or "—"
+                _uploader_role = call.get('uploaded_by_role') or ""
+                _uploader_label = f"{_uploader} ({_uploader_role})" if _uploader_role else _uploader
+                st.markdown(
+                    f"**อัปโหลดเมื่อ:** {_uploaded_ts} &nbsp;•&nbsp; "
+                    f"**โดย:** {_uploader_label}"
+                )
+                st.markdown(
+                    f"**สถานะ:** {status_badge(_eff_st)}",
+                    unsafe_allow_html=True,
+                )
+                if _eff_st == "processing":
+                    step = call.get("processing_step") or "กำลังเริ่มต้น..."
+                    updated = labels.thai_time(call.get("updated_at"))
+                    st.markdown(
+                        f'<div style="color:#93c5fd;font-size:0.85rem;margin-top:4px">{step}</div>'
+                        f'<div style="color:#9ca3af;font-size:0.75rem">อัปเดตล่าสุด: {updated}</div>',
+                        unsafe_allow_html=True,
+                    )
+                render_case_link_status(call, key_suffix="admin")
+                if call["error_msg"]:
+                    st.error(
+                        "ประมวลผลไม่สำเร็จ — กด *ประมวลผล* อีกครั้ง หรือแจ้งผู้ดูแลระบบ  \n"
+                        f"รายละเอียด: {call['error_msg'][:300]}"
+                    )
+
+                # Customer & Warranty context
+                cust_link = db.get_call_customer_link(call["id"])
+                if cust_link:
+                    _match_badge = "จับคู่อัตโนมัติ" if cust_link.get("matched_by") == "auto_phone" else "จับคู่เอง"
+                    with st.expander(f"ข้อมูลลูกค้า & รับประกัน ({_match_badge})"):
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            st.markdown("**ลูกค้า**")
+                            st.markdown(f"ชื่อ: {cust_link['first_name']} {cust_link['last_name']}")
+                            st.markdown(f"เบอร์: `{cust_link['phone'] or '-'}`")
+                            st.markdown(f"อีเมล: {cust_link['email'] or '-'}")
+                        with cc2:
+                            if cust_link.get("registration_no"):
+                                st.markdown("**ทะเบียนรับประกัน**")
+                                st.markdown(f"เลขที่: `{cust_link['registration_no']}`")
+                                st.markdown(f"สินค้า: {cust_link.get('brand') or ''} {cust_link.get('model') or ''}")
+                                st.markdown(f"ขนาด: {cust_link.get('size') or '-'}")
+                                st.markdown(f"ช่องทาง: {cust_link.get('purchase_channel') or '-'}")
+                                st.markdown(f"วันซื้อ: {labels.thai_time(cust_link.get('date_of_purchase'), with_time=False)}")
+                                months = cust_link.get("warranty_period_months") or 0
+                                if months:
+                                    st.markdown(f"ระยะประกัน: {months} เดือน ({months // 12} ปี)")
+                                else:
+                                    st.markdown("ระยะประกัน: ไม่ระบุ")
+                else:
+                    with st.expander("เชื่อมข้อมูลลูกค้า"):
+                        all_custs = db.get_all_customers()
+                        if not all_custs:
+                            st.caption("ยังไม่มีลูกค้าในระบบ — เพิ่มได้ที่เมนู เพิ่ม/แก้ไขข้อมูลลูกค้า")
+                        else:
+                            cust_options = {f"{c['first_name']} {c['last_name']} ({c['phone'] or '-'})": c["id"] for c in all_custs}
+                            sel = st.selectbox("เลือกลูกค้า", ["— เลือก —"] + list(cust_options.keys()), key=f"cust_sel_{call['id']}")
+                            if sel != "— เลือก —":
+                                cid = cust_options[sel]
+                                warrs = db.get_warranties_by_customer(cid)
+                                warr_options = {
+                                    f"{w['registration_no']} — {w.get('brand') or ''} {w.get('model') or ''}": w["id"]
+                                    for w in warrs
+                                }
+                                wsel = st.selectbox("เลือกทะเบียนรับประกัน (ถ้ามี)", ["— ไม่ระบุ —"] + list(warr_options.keys()), key=f"warr_sel_{call['id']}")
+                                plan = None
+                                if call["status"] == "done":
+                                    cases = db.get_open_cases_by_customer(cid)
+                                    options = {c["id"]: f"#{c['id']} {c['subject']}" for c in cases}
+                                    target = st.selectbox("จัดสายเข้าเคส", [None, *options],
+                                                          format_func=lambda key: options.get(key, "สร้างเคสใหม่"),
+                                                          key=f"case_sel_{call['id']}_{cid}")
+                                    plan = {"customer_id": cid, "action": "create"}
+                                    if target is not None:
+                                        plan.update(action="link", case_id=target)
+                                if st.button("เชื่อมข้อมูล", key=f"link_btn_{call['id']}"):
+                                    wid = warr_options.get(wsel) if wsel != "— ไม่ระบุ —" else None
+                                    try:
+                                        db.link_call_customer(call["id"], cid, wid, matched_by="manual", case_plan=plan)
+                                    except ValueError:
+                                        st.warning("ข้อมูลสายเปลี่ยนแล้ว กรุณาโหลดใหม่ก่อนเชื่อมข้อมูล")
+                                        st.stop()
+                                    audit(
+                                        audit_trail.UPDATE,
+                                        audit_trail.ENTITY_CALL,
+                                        entity_id=call["id"],
+                                        entity_label=call["filename"],
+                                        changes={"linked_customer_id": cid, "linked_warranty_id": wid},
+                                    )
+                                    _flash("success", "เชื่อมข้อมูลลูกค้าเรียบร้อยแล้ว")
+                                    if plan is not None:
+                                        st.session_state[f"_case_link_flash_{call['id']}"] = retry_case_link_for_current_user(call["id"])
+                                    st.rerun()
+
+                # Case info
+                if call.get("case_id"):
+                    case = db.get_case_detail(call["case_id"])
+                    if case:
+                        _case_status_map = {"open": "เปิด", "follow_up": "ติดตาม", "closed": "ปิด"}
+                        _cs = _case_status_map.get(case["status"], case["status"])
+                        _owner = case.get("assignee_name") or "ยังไม่มีคนรับ"
+                        sibling_calls = db.get_calls_by_case(case["id"])
+                        with st.expander(f"เคส #{case['id']}: {case['subject']}  —  สถานะ: {_cs}  •  ผู้รับเคส: {_owner}  ({len(sibling_calls)} สาย)"):
+                            if len(sibling_calls) > 1:
+                                for oc in sibling_calls:
+                                    _mark = "สายนี้:" if oc["id"] == call["id"] else "  ↳"
+                                    st.caption(f"{_mark} {oc['filename']}  ({_st_label.get(oc['status'], oc['status'])})")
+                            cs_col1, cs_col2 = st.columns(2)
+                            with cs_col1:
+                                # Claim / status / release — status changes only by
+                                # whoever claimed the case (smartvoice.case_workflow).
+                                render_case_ownership(case, key_suffix=f"call{call['id']}")
+                            with cs_col2:
+                                new_subject = st.text_input(
+                                    "แก้ไขหัวข้อเคส",
+                                    value=case["subject"],
+                                    key=f"case_subj_{call['id']}_{case['id']}",
+                                )
+                                if new_subject != case["subject"]:
+                                    if st.button("บันทึกหัวข้อ", key=f"case_subj_btn_{call['id']}"):
+                                        db.update_case_subject(case["id"], new_subject)
+                                        audit(
+                                            audit_trail.UPDATE,
+                                            audit_trail.ENTITY_CASE,
+                                            entity_id=case["id"],
+                                            entity_label=new_subject,
+                                            changes={"subject": [case["subject"], new_subject]},
+                                        )
+                                        _flash("success", "บันทึกหัวข้อเคสเรียบร้อยแล้ว")
+                                        st.rerun()
+
+                            # Merge with another case (same customer only)
+                            link_info = db.get_call_customer_link(call["id"])
+                            if link_info:
+                                other_cases = [
+                                    cs for cs in db.get_cases_by_customer(link_info["customer_id"])
+                                    if cs["id"] != case["id"]
+                                ]
+                                _held_by_other = case.get("assignee_username") and not case_workflow.is_owner(
+                                    case, current_case_actor()
+                                )
+                                if other_cases and _held_by_other:
+                                    st.markdown("---")
+                                    st.caption(
+                                        f"รวมเคสไม่ได้ — เคสนี้ {case['assignee_name']} รับไว้อยู่ "
+                                        "ต้องคืนเคสหรือปลดผู้รับเคสก่อน"
+                                    )
+                                elif other_cases:
+                                    st.markdown("---")
+                                    st.caption("**รวมเข้ากับเคสอื่น** (ย้ายสายทั้งหมดจากเคสนี้ไปอีกเคส)")
+                                    merge_opts = {
+                                        f"เคส #{cs['id']}: {cs['subject']} ({labels.case_status(cs['status'])})": cs["id"]
+                                        for cs in other_cases
+                                    }
+                                    m_col1, m_col2 = st.columns([3, 1])
+                                    with m_col1:
+                                        picked = st.selectbox(
+                                            "เลือกเคสปลายทาง",
+                                            list(merge_opts.keys()),
+                                            key=f"merge_pick_{call['id']}",
+                                            label_visibility="collapsed",
+                                        )
+                                    with m_col2:
+                                        if st.button("รวมเคส", key=f"merge_btn_{call['id']}"):
+                                            _confirm_merge_dialog(case, merge_opts[picked], picked)
+
+                if call["status"] == "done" and call.get("transcript"):
+                    with st.expander("บทสนทนาแยกผู้พูด"):
+                        render_transcript(call)
+
+            with action_col:
+                effective_status = call["status"]
+                if call["id"] in st.session_state.get("just_launched", set()):
+                    effective_status = "processing"
+
+                if effective_status in ("uploaded", "error"):
+                    if st.button(
+                        "ประมวลผล",
+                        key=f"proc_{call['id']}",
+                        use_container_width=True,
+                        disabled=processing_blocked,
+                    ):
+                        if "just_launched" not in st.session_state:
+                            st.session_state.just_launched = set()
+                        st.session_state.just_launched.add(call["id"])
+                        launch_processing(call["id"])
+                        st.rerun()
+
+                if effective_status == "done":
+                    if st.button(
+                        "ประมวลผลใหม่",
+                        key=f"reproc_{call['id']}",
+                        use_container_width=True,
+                        disabled=processing_blocked,
+                    ):
+                        db.update_call_status(call["id"], "uploaded")
+                        if "just_launched" not in st.session_state:
+                            st.session_state.just_launched = set()
+                        st.session_state.just_launched.add(call["id"])
+                        launch_processing(call["id"])
+                        st.rerun()
+
+                if st.button(
+                    "ลบไฟล์นี้",
+                    key=f"del_{call['id']}",
+                    use_container_width=True,
+                    type="secondary",
+                ):
+                    _confirm_delete_dialog([call], bulk=False)
+
+    # ── "Load more" pagination footer ─────────────────────────────────────
+    _remaining = len(filtered_calls) - len(visible_calls)
+    if _remaining > 0:
+        lm_col1, lm_col2 = st.columns([3, 1])
+        with lm_col1:
+            st.caption(f"แสดง {len(visible_calls)} / {len(filtered_calls)} ไฟล์ (เหลืออีก {_remaining})")
+        with lm_col2:
+            if st.button(f"แสดงเพิ่ม ({min(PAGE_SIZE, _remaining)})", use_container_width=True):
+                st.session_state._call_page_size += PAGE_SIZE
+                st.rerun()
+    elif len(filtered_calls) > PAGE_SIZE:
+        lm_col1, lm_col2 = st.columns([3, 1])
+        with lm_col1:
+            st.caption(f"แสดงครบ {len(filtered_calls)} ไฟล์แล้ว")
+        with lm_col2:
+            if st.button("ย่อกลับ", use_container_width=True):
+                st.session_state._call_page_size = PAGE_SIZE
+                st.rerun()
+

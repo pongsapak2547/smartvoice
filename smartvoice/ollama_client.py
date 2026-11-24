@@ -1,22 +1,23 @@
 import json
-import os
 import re
+from difflib import SequenceMatcher
+from typing import NamedTuple
+
 import requests
 
+from smartvoice import insight_rules, processing_control
+from smartvoice.config import api_settings
 from smartvoice.logger import get_logger
+from smartvoice.prompts import build_transcript_cleanup_prompt
 
 log = get_logger(__name__)
 
-DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "scb10x/llama3.1-typhoon2-8b-instruct"
+class APIError(RuntimeError):
+    pass
 
 
-def _base_url() -> str:
-    return os.getenv("OLLAMA_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-def _model() -> str:
-    return os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+class IncompleteCompletion(APIError):
+    pass
 
 
 def _normalize_llm_output(raw: str) -> str:
@@ -26,21 +27,58 @@ def _normalize_llm_output(raw: str) -> str:
     return raw.strip()
 
 
-def chat(system_prompt: str, user_prompt: str, *, temperature: float = 0) -> str:
-    url = f"{_base_url()}/api/chat"
-    payload = {
-        "model": _model(),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {"temperature": temperature},
-    }
-    response = requests.post(url, json=payload, timeout=600)
-    response.raise_for_status()
-    data = response.json()
-    return data["message"]["content"]
+def chat(
+    system_prompt: str, user_prompt: str, *, temperature: float = 0, json_mode: bool = False
+) -> str:
+    # Each request can take a minute — the Admin stop button takes effect here.
+    processing_control.check()
+    settings = api_settings()
+    return _chat_typhoon(system_prompt, user_prompt, temperature, settings)
+
+
+def _chat_typhoon(system_prompt: str, user_prompt: str, temperature: float, settings: dict) -> str:
+    if not settings["typhoon_key"]:
+        raise ValueError("Set TYPHOON_API_KEY before using Typhoon API")
+    try:
+        response = requests.post(
+            "https://api.opentyphoon.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {settings['typhoon_key']}"},
+            json={
+                "model": settings["typhoon_model"],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": settings["max_tokens"],
+                "stream": False,
+            },
+            timeout=(10, settings["timeout"]),
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise APIError("Typhoon API connection failed or timed out") from None
+    if not 200 <= response.status_code < 300:
+        raise APIError(f"Typhoon API HTTP {response.status_code}; check key, quota and model")
+    processing_control.check()
+    try:
+        payload = response.json()
+        choice = payload["choices"][0]
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            counts = [usage.get(key) for key in ("prompt_tokens", "completion_tokens")]
+            log.info("Typhoon prompt_tokens=%s completion_tokens=%s max_tokens=%d",
+                     *(n if type(n) is int else "unknown" for n in counts), settings["max_tokens"])
+        if choice.get("finish_reason") == "length":
+            raise IncompleteCompletion("Typhoon output truncated")
+        if choice.get("finish_reason") != "stop":
+            raise IncompleteCompletion("Typhoon completion did not finish normally")
+        content = choice["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise IncompleteCompletion("Typhoon API returned an invalid completion")
+        return content
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise APIError("Typhoon API returned an invalid completion") from None
 
 
 def extract_json(raw: str) -> dict:
@@ -55,7 +93,8 @@ def extract_json(raw: str) -> dict:
             continue
         if isinstance(value, dict):
             return value
-    raise ValueError(f"No JSON object found in LLM response: {raw[:300]}")
+    # No excerpt in the message: it can reach logs and calls.error_msg.
+    raise ValueError(f"No JSON object found in LLM response ({len(raw)} chars)")
 
 
 def _extract_json_array(raw: str) -> list | None:
@@ -87,24 +126,22 @@ def correct_speakers(conversation: list[dict]) -> list[dict]:
         raw = chat(system, user)
         corrections = _extract_json_array(raw)
         if not isinstance(corrections, list) or not corrections:
+            # Sizes only: the model's answer quotes the call, and logs leave
+            # the database's access controls (e.g. a central cloud log service).
             log.warning(
-                "correct_speakers: LLM response yielded no JSON array — skipping.\n"
-                "  raw preview: %r",
-                (raw or "")[:400],
+                "correct_speakers: LLM response yielded no JSON array — skipping "
+                "(%d chars)", len(raw or ""),
             )
             return conversation
         # Defensive: LLM sometimes returns bare indices like [0, 3, 5] instead of
         # [{"idx": 0, "speaker": "Agent"}, ...]. Filter out non-dict entries so
         # .get() never crashes.
-        non_dict_sample = [c for c in corrections if not isinstance(c, dict)][:3]
+        non_dict_types = sorted({type(c).__name__ for c in corrections if not isinstance(c, dict)})
         corrections = [c for c in corrections if isinstance(c, dict)]
         if not corrections:
             log.warning(
-                "correct_speakers: LLM returned array of non-dict entries — skipping.\n"
-                "  sample non-dict items: %r\n"
-                "  raw preview: %r",
-                non_dict_sample,
-                (raw or "")[:400],
+                "correct_speakers: LLM returned array of non-dict entries (%s) — skipping",
+                ", ".join(non_dict_types),
             )
             return conversation
         # Build output — handle both simple speaker swap and segment split (parts)
@@ -115,12 +152,19 @@ def correct_speakers(conversation: list[dict]) -> list[dict]:
             if c is None:
                 result.append(dict(item))
             elif "parts" in c:
-                # Split segment into multiple sub-segments
-                for part in c["parts"]:
-                    speaker = part.get("speaker")
-                    text = part.get("text", "").strip()
-                    if speaker in ("Agent", "Customer") and text:
-                        result.append({**item, "speaker": speaker, "text": text})
+                # Split segment into multiple sub-segments — only if the parts are the
+                # segment's own words; otherwise keep it whole (the splitters run later).
+                parts = [
+                    (part.get("speaker"), str(part.get("text") or "").strip())
+                    for part in (c["parts"] if isinstance(c["parts"], list) else [])
+                    if isinstance(part, dict)
+                ]
+                parts = [(speaker, text) for speaker, text in parts if speaker in ("Agent", "Customer") and text]
+                if parts and insight_rules.split_keeps_text([text for _, text in parts], item.get("text", "")):
+                    result.extend({**item, "speaker": speaker, "text": text} for speaker, text in parts)
+                else:
+                    log.warning("correct_speakers: split of segment %s doesn't match its text — kept whole", i)
+                    result.append(dict(item))
             else:
                 speaker = c.get("speaker")
                 new_item = dict(item)
@@ -128,63 +172,148 @@ def correct_speakers(conversation: list[dict]) -> list[dict]:
                     new_item["speaker"] = speaker
                 result.append(new_item)
         return result
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("correct_speakers failed — returning original conversation")
         return conversation
 
 
-def cleanup_transcript(conversation: list[dict]) -> list[dict]:
-    """Use LLM to fix garbled/hallucinated text from STT."""
-    from smartvoice.prompts import build_transcript_cleanup_prompt
+class _CleanupRow(NamedTuple):
+    index: int
+    start: int
+    end: int
+    prefix: str
+    line: str
 
+
+def _cleanup_spans(text: str, width: int):
+    for line in re.finditer(r"[^\r\n]+", text):
+        start = end = None
+        for word in re.finditer(r"\S+", line.group()):
+            left, right = line.start() + word.start(), line.start() + word.end()
+            if start is not None and right - start > width:
+                yield start, end
+                start = None
+            if start is None:
+                start = left
+            end = right
+        if start is not None:
+            yield start, end
+
+
+def _cleanup_chunks(conversation: list[dict], budget: int):
+    chunk = []
+    size = 0
+    for idx, item in enumerate(conversation):
+        text = item.get("text") or ""
+        prefix = f"[{idx}] {item.get('speaker', 'Unknown')}: "
+        for start, end in _cleanup_spans(text, budget - len(prefix)):
+            row = prefix + text[start:end]
+            if chunk and (size + 1 + len(row) > budget or chunk[-1].index == idx):
+                yield chunk
+                chunk = []
+                size = 0
+            size += len(row) + (1 if chunk else 0)
+            chunk.append(_CleanupRow(idx, start, end, prefix, row))
+    if chunk:
+        yield chunk
+
+
+_NOISE_LABEL = re.compile(r"\[(?:noise|background noise|เสียงรบกวน|เสียงซ่า)\]", re.IGNORECASE)
+_PROTECTED_TERMS = re.compile(r"\d+|ไม่|ห้าม|อย่า(?!ง)|\b(?:no|not|never)\b", re.IGNORECASE)
+
+
+def _cleanup_replacement(source: str, value: str) -> str | None:
+    if value == source:
+        return value
+    speech = _NOISE_LABEL.sub("", source).strip()
+    if not value or value in ("<REMOVE>", "[REMOVE]", "REMOVE"):
+        return None if speech else ""
+    if _PROTECTED_TERMS.findall(speech) != _PROTECTED_TERMS.findall(value):
+        return None
+    words = speech.split()
+    kept = value.split()
+    if len(kept) < len(words):
+        remaining_words = iter(words)
+        if all(word in remaining_words for word in kept):
+            return None
+    if len(speech) >= 80:
+        return value if insight_rules.split_keeps_text([value], speech) else None
+    original = "".join(speech.split())
+    cleaned = "".join(value.split())
+    if original == cleaned:
+        return value
+    matches = SequenceMatcher(None, original, cleaned, autojunk=False).get_matching_blocks()
+    matched = sum(block.size for block in matches)
+    tolerance = 1 if len(original) < 12 else 2
+    if matched >= 2 and max(len(cleaned), len(original)) - matched <= tolerance:
+        return value
+    return None
+
+
+def cleanup_transcript(conversation: list[dict], *, call_id: int | None = None,
+                       cleanup_pass: int | None = None) -> list[dict]:
+    """Use LLM to fix garbled/hallucinated text from STT."""
     if not conversation:
         return conversation
 
+    settings = api_settings()
+    budget = min(settings["cleanup_chunk_chars"], settings["max_tokens"])
+
     # Build indexed text for the LLM
-    conversation_text = "\n".join(
-        f"[{i}] {item.get('speaker', 'Unknown')}: {item.get('text', '')}"
-        for i, item in enumerate(conversation)
-        if item.get("text")
-    )
+    edits: dict[int, list[tuple[int, int, str]]] = {}
+    for index, chunk in enumerate(_cleanup_chunks(conversation, budget), start=1):
+        context = (call_id, cleanup_pass, index)
+        if len(chunk[0].line) > budget:
+            log.warning("Cleanup kept oversized span call_id=%s cleanup_pass=%s chunk_index=%d", *context)
+            continue
+        system, user = build_transcript_cleanup_prompt("\n".join(row.line for row in chunk))
+        try:
+            lines = _normalize_llm_output(chat(system, user)).splitlines()
+        except IncompleteCompletion:
+            log.warning("Cleanup kept source for incomplete completion call_id=%s cleanup_pass=%s chunk_index=%d", *context)
+            continue
+        except APIError:
+            log.warning("Cleanup request failed call_id=%s cleanup_pass=%s chunk_index=%d", *context)
+            raise
 
-    system, user = build_transcript_cleanup_prompt(conversation_text)
-    try:
-        raw = _normalize_llm_output(chat(system, user))
-        cleaned_map: dict[int, str | None] = {}
-        for line in raw.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            m = re.match(r"\[(\d+)\]\s*[^:]+:\s*(.*)", line)
-            if m:
-                idx = int(m.group(1))
-                text = m.group(2).strip()
-                if text in ("<REMOVE>", "[REMOVE]", "REMOVE"):
-                    cleaned_map[idx] = None
-                else:
-                    cleaned_map[idx] = text
+        replacements = []
+        for line, row in zip(lines, chunk):
+            if not line.startswith(row.prefix):
+                break
+            source = conversation[row.index]["text"][row.start:row.end]
+            value = _cleanup_replacement(source, line[len(row.prefix):].strip())
+            if value is None:
+                break
+            replacements.append(value)
+        if len(lines) != len(chunk) or len(replacements) != len(chunk):
+            log.warning("Cleanup kept source for unverified response call_id=%s cleanup_pass=%s chunk_index=%d", *context)
+            continue
 
-        if not cleaned_map:
-            return conversation
+        for row, value in zip(chunk, replacements):
+            edits.setdefault(row.index, []).append((row.start, row.end, value))
 
-        result = []
-        for i, item in enumerate(conversation):
-            if i in cleaned_map and cleaned_map[i] is None:
-                continue
-            new_item = dict(item)
-            if i in cleaned_map and cleaned_map[i]:
-                new_item["text"] = cleaned_map[i]
-            result.append(new_item)
-        return result
-    except Exception:
-        log.exception("cleanup_transcript failed — returning original conversation")
-        return conversation
+    result = [dict(item) for item in conversation]
+    for idx, spans in edits.items():
+        text = conversation[idx]["text"]
+        pieces = []
+        cursor = 0
+        for start, end, value in spans:
+            pieces.extend((text[cursor:start], value))
+            cursor = end
+        result[idx]["text"] = "".join(pieces) + text[cursor:]
+    return result
 
 
-MAX_SEGMENTS = 60
-MAX_CHARS = 6000
-HEAD_SEGMENTS = 30
-TAIL_SEGMENTS = MAX_SEGMENTS - HEAD_SEGMENTS
+# ~7k tokens of Thai; with the longest prompt this stays inside _num_ctx().
+MAX_CHARS = 14000
+# When a call is longer, keep its opening and its ending (greeting, problem,
+# and what was agreed at the close) and drop the middle.
+HEAD_SHARE = 0.4
+_ELLIPSIS_LINE = "...(ตัดช่วงกลางของบทสนทนาออกเพราะยาวเกิน)..."
 
 
 def _normalize_bool(value) -> bool:
@@ -255,9 +384,15 @@ def _fallback_next_action_from_conversation(conversation_text: str) -> tuple[str
 def sanitize_next_action(
     next_action: str, next_action_owner: str, conversation_text: str
 ) -> tuple[str, str]:
+    """Also used at display time, so rows saved by older prompts get cleaned too."""
     if _looks_like_copied_next_action_example(next_action or "", conversation_text or ""):
         return _fallback_next_action_from_conversation(conversation_text or "")
-    return next_action, next_action_owner
+    if insight_rules.money_action_is_ungrounded(next_action or "", conversation_text or ""):
+        log.warning("next_action mentions a refund on a call with no money talk — replacing")
+        return _fallback_next_action_from_conversation(conversation_text or "")
+    if (next_action or "").startswith("ไม่มี"):
+        return next_action, next_action_owner
+    return insight_rules.clean_next_action_text(next_action) or next_action, next_action_owner
 
 
 # Placeholder fragments that Typhoon-8B has been observed copying verbatim from
@@ -317,42 +452,134 @@ def _evidence_is_vague(evidence: str) -> bool:
 
 _EVIDENCE_FALLBACK = "ไม่พบหลักฐานที่ชัดเจนใน transcript — โปรด re-process หรือฟังสายเพื่อตรวจสอบ"
 
+# Concrete fake values previously used in the Agent QA prompt's "รูปแบบที่ถูก"
+# example. Typhoon-8B copied them verbatim into evidence on most calls, so any
+# row that still references them — without the same string actually appearing
+# in the real transcript — is template leakage and must be scrubbed.
+_EVIDENCE_PROMPT_EXAMPLE_TOKENS = ("ร้านที่นอนพลอย", "พลอยค่ะ")
 
-def sanitize_evidence(evidence: str) -> str:
+
+def _evidence_has_prompt_example_leak(evidence: str, conversation_text: str) -> bool:
+    if not evidence:
+        return False
+    convo = conversation_text or ""
+    return any(tok in evidence and tok not in convo for tok in _EVIDENCE_PROMPT_EXAMPLE_TOKENS)
+
+
+def sanitize_evidence(evidence: str, conversation_text: str = "") -> str:
     """Clean LLM evidence strings before display.
 
     Why: Typhoon-8B sometimes copies the JSON-schema placeholder
     (e.g. "[ข้อ + quote สั้น]") straight into politeness_evidence /
     problem_solving_evidence, leaving users staring at template syntax instead
     of real findings. Also drops vague summaries like "ทำได้: ทุกข้อ" that
-    carry no quotes or item names.
+    carry no quotes or item names, and prompt-example tokens (e.g.
+    "ร้านที่นอนพลอย") that the model lifted from the QA prompt even though the
+    real conversation never said them.
     """
     if not evidence:
         return ""
     text = str(evidence).strip()
     if _evidence_is_leaked(text) or _evidence_is_vague(text):
-        log.warning("sanitize_evidence: detected leaked/vague evidence %r", text[:120])
+        log.warning("sanitize_evidence: detected leaked/vague evidence (%d chars)", len(text))
+        return _EVIDENCE_FALLBACK
+    if _evidence_has_prompt_example_leak(text, conversation_text):
+        log.warning(
+            "sanitize_evidence: evidence quotes prompt-example token absent from transcript "
+            "(%d chars)", len(text),
+        )
         return _EVIDENCE_FALLBACK
     return text
 
 
 def _prepare_conversation_text(conversation) -> str:
-    """Convert conversation list/str to capped text for LLM prompts."""
+    """Conversation list/str → "Speaker: text" lines within MAX_CHARS.
+
+    Over budget, the middle is dropped on line boundaries — the old cut kept
+    only the first 6,000 characters, losing the close of 4 in 11 real calls
+    (the closing greeting and what was agreed are scored from the end).
+    """
     if isinstance(conversation, list):
-        all_segs = [item for item in conversation if item.get("text")]
-        if len(all_segs) > MAX_SEGMENTS:
-            segs = all_segs[:HEAD_SEGMENTS] + all_segs[-TAIL_SEGMENTS:]
-        else:
-            segs = all_segs[:MAX_SEGMENTS]
-        text = "\n".join(
+        lines = [
             f"{item.get('speaker', 'Unknown')}: {item.get('text', '')}"
-            for item in segs
-        )
+            for item in conversation
+            if item.get("text")
+        ]
     else:
-        text = str(conversation)
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS] + "\n...(ตัดบทสนทนาที่เกินมา)"
-    return text
+        lines = str(conversation).splitlines()
+    text = "\n".join(lines)
+    if len(text) <= MAX_CHARS:
+        return text
+
+    head_budget = int(MAX_CHARS * HEAD_SHARE)
+    tail_budget = MAX_CHARS - head_budget
+    head, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > head_budget:
+            break
+        head.append(line)
+        used += len(line) + 1
+    tail, used = [], 0
+    for line in reversed(lines[len(head):]):
+        if used + len(line) + 1 > tail_budget:
+            break
+        tail.append(line)
+        used += len(line) + 1
+    if not head and not tail:  # one enormous line
+        return text[:head_budget] + "\n" + _ELLIPSIS_LINE + "\n" + text[-tail_budget:]
+    return "\n".join(head + [_ELLIPSIS_LINE] + list(reversed(tail)))
+
+
+# Allowed topic_detail values when topic = "แจ้งปัญหาสินค้า". Kept in sync with
+# the controlled vocabulary in prompts.py so the LLM cannot drift the labels.
+PRODUCT_ISSUE_TOPIC = "แจ้งปัญหาสินค้า"
+TOPIC_DETAIL_CHOICES = (
+    "ผ้าขาด/ผ้าหุ้มชำรุด",
+    "เตียง/โครงหัก",
+    "สปริง/ฟองน้ำยุบ",
+    "เปื้อน/รอยขีดข่วน",
+    "ความชื้น/น้ำท่วม",
+    "ขนาด/สเปคผิด",
+    "กลิ่น/แพ้/ระคายเคือง",
+    "อื่นๆ",
+)
+_TOPIC_DETAIL_FALLBACK = "อื่นๆ"
+# Stem keywords used to snap LLM rewordings back to the canonical label.
+# Order matters: first hit wins, so put more specific stems before generic ones.
+# Stems are whole words on purpose: the old bare "รา" matched "รายละเอียด"
+# and "ผ้า" matched "ผ้าห่ม", snapping unrelated answers onto those labels.
+_TOPIC_DETAIL_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("กลิ่น/แพ้/ระคายเคือง", ("แพ้", "ผื่น", "คัน", "แสบ", "ระคายเคือง", "กลิ่น", "สารเคมี")),
+    ("เปื้อน/รอยขีดข่วน",   ("เปื้อน", "คราบ", "รอยขีด", "ขีดข่วน", "รอยถลอก")),
+    ("ความชื้น/น้ำท่วม",    ("เชื้อรา", "ราขึ้น", "ความชื้น", "อับชื้น", "น้ำท่วม", "น้ำหก")),
+    ("สปริง/ฟองน้ำยุบ",     ("สปริง", "ฟองน้ำ", "ยุบ", "เป็นแอ่ง")),
+    ("เตียง/โครงหัก",       ("เตียงหัก", "โครงเตียง", "โครงหัก", "ขาเตียง", "หัวเตียง")),
+    ("ผ้าขาด/ผ้าหุ้มชำรุด", ("ผ้าขาด", "ผ้าหุ้ม", "ปลอก", "ผ้าฉีก", "ผ้ารอง")),
+    ("ขนาด/สเปคผิด",        ("ขนาดไม่ตรง", "ผิดรุ่น", "สเปคผิด", "สีผิด", "ผิดสเปค", "ไม่ตรงปก", "ไม่ครบ", "ไม่ตรงที่สั่ง", "สีไม่ตรง", "รุ่นไม่ตรง", "ขนาดผิด")),
+)
+
+
+def normalize_topic_detail(topic: str, raw_detail) -> str:
+    """Clamp LLM-produced topic_detail to the allowed vocabulary.
+
+    Why: Typhoon-8B occasionally rewords labels ("ผ้าขาด/ผ้าหุ้มชำรุด" →
+    "ผ้าหุ้มขาด") or fills the field even when topic isn't a product-issue
+    call. Keeping the DB on a fixed vocabulary lets the dashboard group cleanly.
+    """
+    if topic != PRODUCT_ISSUE_TOPIC:
+        return ""
+    if not isinstance(raw_detail, str):
+        return _TOPIC_DETAIL_FALLBACK
+    cleaned = raw_detail.strip()
+    if not cleaned:
+        return _TOPIC_DETAIL_FALLBACK
+    if cleaned in TOPIC_DETAIL_CHOICES:
+        return cleaned
+    for label, stems in _TOPIC_DETAIL_KEYWORDS:
+        for stem in stems:
+            if stem in cleaned:
+                return label
+    return _TOPIC_DETAIL_FALLBACK
 
 
 def extract_summary_and_topics(conversation) -> dict:
@@ -362,18 +589,33 @@ def extract_summary_and_topics(conversation) -> dict:
     text = _prepare_conversation_text(conversation)
     system, user = build_extraction_prompt(text)
     try:
-        result = extract_json(chat(system, user))
+        result = extract_json(chat(system, user, json_mode=True))
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("extract_summary_and_topics: LLM call/parse failed — using empty defaults")
         result = {}
 
     keywords = result.get("keywords", [])
-    brand_mentions = result.get("brand_mentions", [])
-    platform_mentions = result.get("platform_mentions", [])
+    keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()][:8] if isinstance(keywords, list) else []
+    # Only names actually said in the call, one spelling each (the model used
+    # to list the group's five brands from the prompt on calls that never
+    # mentioned them, and "Lotus", "โลตัส", "Lotus/โลตัส" split the chart).
+    brand_mentions = insight_rules.canonical_mentions(
+        result.get("brand_mentions", []), text, insight_rules.BRAND_ALIASES
+    )
+    platform_mentions = insight_rules.canonical_mentions(
+        result.get("platform_mentions", []), text, insight_rules.PLATFORM_ALIASES
+    )
+    topic = insight_rules.normalize_topic(result.get("topic", "")) if result.get("topic") else ""
+    topic_detail = normalize_topic_detail(topic, result.get("topic_detail", ""))
 
     return {
         "summary": result.get("summary", ""),
-        "topic": result.get("topic", ""),
+        "topic": topic,
+        "topic_detail": topic_detail,
         "keywords": json.dumps(keywords if isinstance(keywords, list) else [], ensure_ascii=False),
         "brand_mentions": json.dumps(brand_mentions if isinstance(brand_mentions, list) else [], ensure_ascii=False),
         "platform_mentions": json.dumps(platform_mentions if isinstance(platform_mentions, list) else [], ensure_ascii=False),
@@ -387,18 +629,33 @@ def analyze_sentiment(conversation) -> dict:
     text = _prepare_conversation_text(conversation)
     system, user = build_sentiment_prompt(text)
     try:
-        result = extract_json(chat(system, user))
+        result = extract_json(chat(system, user, json_mode=True))
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("analyze_sentiment: LLM call/parse failed — defaulting to neutral")
         result = {}
 
-    sentiment = result.get("sentiment", "neutral").lower()
+    sentiment = str(result.get("sentiment") or "neutral").strip().lower()
     if sentiment not in ("positive", "neutral", "negative"):
         sentiment = "neutral"
 
+    reason = " ".join(str(result.get("sentiment_reason") or "").split())
+    quote = " ".join(str(result.get("customer_quote") or "").split())
+    customer_text = insight_rules.speaker_text(text, "Customer")
+    if not insight_rules.quote_in_text(quote, customer_text):
+        quote = ""
+    sentiment = insight_rules.check_sentiment(sentiment, quote, customer_text)
+    if quote:
+        # Show the customer's own words next to the label — only when they
+        # really occur in what the customer said.
+        reason = f"{reason} — ลูกค้าพูดว่า: \"{quote}\"" if reason else f"ลูกค้าพูดว่า: \"{quote}\""
+
     return {
         "sentiment": sentiment,
-        "sentiment_reason": result.get("sentiment_reason", ""),
+        "sentiment_reason": reason,
     }
 
 
@@ -438,17 +695,55 @@ def evaluate_agent_qa(conversation) -> dict:
     text = _prepare_conversation_text(conversation)
     system, user = build_agent_qa_prompt(text)
     try:
-        result = extract_json(chat(system, user, temperature=0.3))
+        # temperature 0: the same call must get the same score when re-processed.
+        result = extract_json(chat(system, user, json_mode=True))
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("evaluate_agent_qa: LLM call/parse failed — defaulting to mid scores")
         result = {}
 
-    politeness = _coerce_score(result.get("politeness"), default=3)
-    problem_solving = _coerce_score(result.get("problem_solving"), default=3)
+    if insight_rules.has_itemised_qa(result):
+        # Scores computed here from items whose quotes the agent really said —
+        # the model's own totals came out 5/5 on every call.
+        items = insight_rules.items_from_answer(result)
+        politeness, politeness_evidence = insight_rules.score_items(
+            items, insight_rules.POLITENESS_ITEMS, text
+        )
+        problem_solving, problem_solving_evidence = insight_rules.score_items(
+            items, insight_rules.PROBLEM_SOLVING_ITEMS, text
+        )
+    else:  # older answer format: {"politeness": n, "politeness_evidence": "..."}
+        politeness = _coerce_score(result.get("politeness"), default=3)
+        problem_solving = _coerce_score(result.get("problem_solving"), default=3)
+        politeness_evidence = sanitize_evidence(result.get("politeness_evidence", ""), text)
+        problem_solving_evidence = sanitize_evidence(result.get("problem_solving_evidence", ""), text)
     overall_score = politeness + problem_solving
 
-    next_action_owner = result.get("next_action_owner") or "ไม่มี"
-    next_action = result.get("next_action") or "ไม่มี — เคสปิดสมบูรณ์"
+    # The next step is its own request (see prompts.NEXT_ACTION_USER): asked
+    # alongside the checklist, the model marked plainly open calls as closed.
+    from smartvoice.prompts import build_next_action_prompt
+
+    try:
+        na_system, na_user = build_next_action_prompt(text)
+        next_answer = extract_json(chat(na_system, na_user, json_mode=True))
+    except APIError:
+        raise
+    except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
+        log.exception("evaluate_agent_qa: next-action call failed — using the QA answer")
+        next_answer = {}
+    structured = insight_rules.build_next_action(next_answer, text) or insight_rules.build_next_action(
+        result.get("next_action"), text
+    )
+    if structured:
+        next_action, next_action_owner = structured
+    else:
+        next_action_owner = result.get("next_action_owner") or "ไม่มี"
+        next_action = result.get("next_action") or insight_rules.CLOSED_NEXT_ACTION
     if _looks_like_copied_next_action_example(next_action, text):
         next_action, next_action_owner = _fallback_next_action_from_conversation(text)
     else:
@@ -475,9 +770,9 @@ def evaluate_agent_qa(conversation) -> dict:
 
     agent_perf = {
         "politeness": politeness,
-        "politeness_evidence": sanitize_evidence(result.get("politeness_evidence", "")),
+        "politeness_evidence": politeness_evidence,
         "problem_solving": problem_solving,
-        "problem_solving_evidence": sanitize_evidence(result.get("problem_solving_evidence", "")),
+        "problem_solving_evidence": problem_solving_evidence,
         "overall_score": overall_score,
         "next_action": next_action,
         "next_action_owner": next_action_owner,
@@ -496,20 +791,18 @@ def detect_anomaly(conversation) -> dict:
     text = _prepare_conversation_text(conversation)
     system, user = build_anomaly_prompt(text)
     try:
-        result = extract_json(chat(system, user))
+        result = extract_json(chat(system, user, json_mode=True))
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("detect_anomaly: LLM call/parse failed — defaulting to no anomaly")
         result = {}
 
-    severity = result.get("anomaly_severity") or ""
-    if severity not in ("low", "medium", "high"):
-        severity = ""
-
-    return {
-        "anomaly_detected": _normalize_bool(result.get("anomaly_detected", False)),
-        "anomaly_reason": result.get("anomaly_reason") or "",
-        "anomaly_severity": severity,
-    }
+    # Flag only with a quote that occurs in the call and carries a keyword of
+    # its category; severity follows the category (insight_rules).
+    return insight_rules.verify_anomaly(result, text)
 
 
 def analyze_transcript(conversation) -> dict:
@@ -528,14 +821,20 @@ def analyze_transcript(conversation) -> dict:
     }
 
 
-def match_case(new_topic: str, new_summary: str, existing_cases: list[dict]) -> dict:
+def match_case(
+    new_topic: str, new_summary: str, existing_cases: list[dict], new_call_at: str | None = None
+) -> dict:
     """Call LLM to decide if a new call belongs to an existing case or needs a new one."""
     from smartvoice.prompts import build_case_match_prompt
 
-    system, user = build_case_match_prompt(new_topic, new_summary, existing_cases)
+    system, user = build_case_match_prompt(new_topic, new_summary, existing_cases, new_call_at)
     try:
-        result = extract_json(chat(system, user))
+        result = extract_json(chat(system, user, json_mode=True))
+    except APIError:
+        raise
     except Exception:
+        if api_settings()["llm_provider"] == "typhoon":
+            raise APIError("Typhoon response could not be processed; no default analysis was saved") from None
         log.exception("match_case: LLM call/parse failed — creating new case instead")
         result = {}
 

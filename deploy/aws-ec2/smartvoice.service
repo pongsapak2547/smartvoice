@@ -1,0 +1,43 @@
+# SmartVoice web app (Streamlit) — installed to /etc/systemd/system by install.sh.
+# Listens on 127.0.0.1 only; Caddy terminates HTTPS in front of it.
+[Unit]
+Description=SmartVoice call-analytics web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smartvoice
+Group=smartvoice
+WorkingDirectory=/opt/smartvoice/app
+# Streamlit keeps a few files under $HOME; give it a private state dir.
+StateDirectory=smartvoice
+Environment=HOME=/var/lib/smartvoice
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/smartvoice/venv/bin/python -m streamlit run Home.py \
+    --server.address 127.0.0.1 \
+    --server.port 8501 \
+    --server.headless true \
+    --server.fileWatcherType none \
+    --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=5
+# Background processing runs in threads of this process; give a running call
+# time to reach a checkpoint before systemd kills it on stop/restart.
+TimeoutStopSec=30
+
+# Hardening: the app may write only its data folder and its .env (Settings page).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/smartvoice/app/data /opt/smartvoice/app/.env
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

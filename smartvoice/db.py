@@ -1,6 +1,15 @@
+import json
 import os
 import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+from smartvoice import database_backend
+
+
+class LastAdminError(sqlite3.IntegrityError):
+    pass
 
 
 def _now() -> str:
@@ -13,6 +22,8 @@ def get_db_path() -> str:
 
 
 def get_connection() -> sqlite3.Connection:
+    if database_backend.database_url():
+        return database_backend.connect()
     db_path = get_db_path()
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -23,8 +34,12 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    if database_backend.database_url():
+        database_backend.check_schema()
+        return
     conn = get_connection()
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS calls (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +115,32 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                username       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name   TEXT NOT NULL,
+                role           TEXT NOT NULL,
+                password_hash  TEXT NOT NULL,
+                is_active      INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL,
+                last_login_at  TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor         TEXT,
+                actor_role    TEXT,
+                action        TEXT NOT NULL,
+                entity        TEXT NOT NULL,
+                entity_id     INTEGER,
+                entity_label  TEXT,
+                changes       TEXT,
+                created_at    TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS cases (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_id   INTEGER REFERENCES customers(id),
@@ -110,11 +151,136 @@ def init_db() -> None:
                 updated_at    TEXT NOT NULL
             )
         """)
+        _create_sales_order_tables(conn)
         _migrate(conn)
     conn.close()
 
 
+# ── Sales orders (SO) ─────────────────────────────────────────────────────
+# Mirrors the company's sales-order document (Dynamics NAV "ใบสั่งขาย"): a
+# header with sell-to / ship-to parties and totals, plus item lines.
+SO_HEADER_COLUMNS = (
+    "so_number", "document_date", "order_date", "shipment_date", "promised_delivery_date",
+    "due_date", "currency", "sales_type", "purchasing_type", "salesperson",
+    "external_doc", "credit_term", "customer_po_no",
+    "sell_to_no", "sell_to_name", "sell_to_address", "sell_to_contact", "sell_to_phone",
+    "ship_to_name", "ship_to_address", "ship_to_contact", "ship_to_phone", "ship_to_email",
+    "total", "discount", "net_amount", "vat", "grand_total", "remark",
+)
+SO_LINE_COLUMNS = (
+    "line_no", "item_no", "description", "requested_delivery_date", "uom",
+    "location", "quantity", "unit_price", "discount", "amount",
+)
+_SO_MONEY_COLUMNS = {"total", "discount", "net_amount", "vat", "grand_total"}
+
+
+def _create_sales_order_tables(conn: sqlite3.Connection) -> None:
+    header_cols = ",\n".join(
+        f"                {col} {'REAL' if col in _SO_MONEY_COLUMNS else 'TEXT'}"
+        for col in SO_HEADER_COLUMNS if col != "so_number"
+    )
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS sales_orders (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            so_number    TEXT NOT NULL UNIQUE,
+{header_cols},
+            customer_id  INTEGER REFERENCES customers(id),
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            created_by   TEXT,
+            deleted_at   TEXT,
+            deleted_by   TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sales_order_lines (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            sales_order_id           INTEGER NOT NULL REFERENCES sales_orders(id) ON DELETE CASCADE,
+            line_no                  INTEGER,
+            item_no                  TEXT,
+            description              TEXT,
+            requested_delivery_date  TEXT,
+            uom                      TEXT,
+            location                 TEXT,
+            quantity                 REAL,
+            unit_price               REAL,
+            discount                 REAL,
+            amount                   REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_so_customer ON sales_orders(customer_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_so_ship_phone ON sales_orders(ship_to_phone)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_so_lines_order ON sales_order_lines(sales_order_id)")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
+    _migrate_calls(conn)
+    _migrate_soft_delete(conn)
+    _migrate_case_assignment(conn)
+    _migrate_warranty_fields(conn)
+    _migrate_case_linking(conn)
+
+
+def _migrate_warranty_fields(conn: sqlite3.Connection) -> None:
+    """Fields the company's warranty-registration system has and we lacked.
+
+    `status` is the system's Active/Cancelled state — a cancelled registration
+    is still shown (with its status), unlike a hidden (`deleted_at`) row.
+    """
+    for table, columns in (
+        ("customers", (("nick_name", "TEXT"), ("channel", "TEXT"))),
+        ("warranty_registrations", (
+            ("ref_id", "TEXT"), ("so_number", "TEXT"),
+            ("status", "TEXT DEFAULT 'active'"), ("cancelled_at", "TEXT"),
+            ("cancelled_by", "TEXT"), ("proof_path", "TEXT"),
+        )),
+    ):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, col_type in columns:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
+def _migrate_case_assignment(conn: sqlite3.Connection) -> None:
+    """Add the case-ownership columns to existing databases.
+
+    A staff member claims a case (`assignee_*`); from then on only they can
+    change its status, so nobody else can take it over. `closed_by` /
+    `closed_at` record who closed it, since the assignee can be released later.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(cases)").fetchall()}
+    for col in ("assignee_username", "assignee_name", "assigned_at", "closed_by", "closed_at"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE cases ADD COLUMN {col} TEXT")
+
+
+def _migrate_soft_delete(conn: sqlite3.Connection) -> None:
+    """Add the soft-delete columns to existing databases.
+
+    Customers and warranty registrations are never removed from the database —
+    they are hidden by stamping `deleted_at`, so the row stays available as a
+    record of what happened (see `soft_delete_customer`).
+    """
+    for table in ("customers", "warranty_registrations"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in ("deleted_at", "deleted_by"):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+
+    # Marks the warranties that were hidden *because* their customer was hidden,
+    # so restoring the customer brings back exactly those (and not the ones an
+    # Admin hid separately). A timestamp cannot tell them apart — two hides in
+    # the same second would collide.
+    warranty_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(warranty_registrations)").fetchall()
+    }
+    if "hidden_with_customer" not in warranty_cols:
+        conn.execute(
+            "ALTER TABLE warranty_registrations ADD COLUMN hidden_with_customer INTEGER DEFAULT 0"
+        )
+
+
+def _migrate_calls(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(calls)").fetchall()}
     new_cols = [
         ("speaker_mapping",   "TEXT"),
@@ -131,6 +297,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("case_id",            "INTEGER"),
         ("uploaded_by",       "TEXT"),
         ("uploaded_by_role",  "TEXT"),
+        ("topic_detail",      "TEXT"),
     ]
     for col, col_type in new_cols:
         if col not in existing:
@@ -212,6 +379,7 @@ def update_call_results(
     anomaly_reason: str = "",
     sentiment_reason: str = "",
     anomaly_severity: str = "",
+    topic_detail: str = "",
 ) -> None:
     now = _now()
     conn = get_connection()
@@ -224,7 +392,13 @@ def update_call_results(
                 brand_mentions = ?, platform_mentions = ?,
                 anomaly_detected = ?, anomaly_reason = ?,
                 sentiment_reason = ?, anomaly_severity = ?,
-                status = 'done', updated_at = ?
+                topic_detail = ?,
+                status = 'done', updated_at = ?,
+                case_link_status = CASE
+                    WHEN case_id IS NOT NULL OR EXISTS (SELECT 1 FROM call_customer_links WHERE call_id = calls.id)
+                    THEN 'pending' ELSE 'not_required' END,
+                case_link_plan = CASE WHEN case_id IS NULL THEN NULL ELSE case_link_plan END,
+                case_link_error = NULL, case_link_updated_at = ?
             WHERE id = ?
             """,
             (
@@ -233,19 +407,137 @@ def update_call_results(
                 brand_mentions, platform_mentions,
                 int(anomaly_detected), anomaly_reason,
                 sentiment_reason, anomaly_severity,
-                now, call_id,
+                topic_detail,
+                now, now, call_id,
             ),
         )
     conn.close()
 
 
-def get_all_calls() -> list[dict]:
+def get_all_calls(limit: int | None = None) -> list[dict]:
+    """Return all calls newest-first.
+
+    `limit=None` keeps the original behavior (return everything). Passing an
+    int caps the result for the Admin page so it stays responsive at scale
+    (10K+ uploads). Status counts displayed at the top of the page should
+    use `count_calls_by_status()` so they remain accurate even when this
+    call returns a capped subset.
+    """
+    conn = get_connection()
+    sql = "SELECT * FROM calls ORDER BY created_at DESC"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (int(limit),)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_calls_by_status() -> dict[str, int]:
+    """Return {'uploaded': N, 'processing': N, 'done': N, 'error': N, 'total': N}.
+
+    Implemented as a single GROUP BY so the Admin page can show accurate
+    counts without loading the full table.
+    """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM calls ORDER BY created_at DESC"
+        "SELECT status, COUNT(*) AS n FROM calls GROUP BY status"
+    ).fetchall()
+    conn.close()
+    counts = {"uploaded": 0, "processing": 0, "done": 0, "error": 0}
+    for r in rows:
+        if r["status"] in counts:
+            counts[r["status"]] = int(r["n"] or 0)
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def count_anomaly_calls() -> dict[str, int]:
+    """{'total': N, 'high': N} — analysed calls flagged as anomalies, for the
+    home page's "งานที่รอคุณ" cards (one SQL count, no rows loaded)."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN anomaly_severity = 'high' THEN 1 ELSE 0 END) AS high
+           FROM calls WHERE status = 'done' AND anomaly_detected = 1"""
+    ).fetchone()
+    conn.close()
+    return {"total": int(row["total"] or 0), "high": int(row["high"] or 0)}
+
+
+def get_pending_call_ids() -> list[int]:
+    """Return IDs of every call awaiting processing (status='uploaded').
+
+    Used by "Process All Pending" — the Admin page now loads only the latest
+    N rows for display, so we cannot derive the full pending set from that
+    capped list.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id FROM calls WHERE status = 'uploaded' ORDER BY created_at ASC"
+    ).fetchall()
+    conn.close()
+    return [int(r["id"]) for r in rows]
+
+
+def get_processing_calls() -> list[dict]:
+    """Return all calls currently in 'processing' state (usually 0-1 rows).
+
+    Used by the Admin auto-refresh fragment so it doesn't have to scan the
+    whole table every 3 seconds.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM calls WHERE status = 'processing' ORDER BY updated_at DESC"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_calls_progress(call_ids: list[int]) -> list[dict]:
+    """Light rows for the live run panel on the Admin page, in `call_ids` order.
+
+    Polled every few seconds, so it skips the transcript and other long text.
+    """
+    if not call_ids:
+        return []
+    placeholders = ",".join("?" * len(call_ids))
+    conn = get_connection()
+    rows = conn.execute(
+        f"""
+        SELECT id, filename, status, processing_step, topic, topic_detail,
+               sentiment, anomaly_detected, anomaly_severity, updated_at
+        FROM calls WHERE id IN ({placeholders})
+        """,
+        list(call_ids),
+    ).fetchall()
+    conn.close()
+    by_id = {r["id"]: dict(r) for r in rows}
+    return [by_id[cid] for cid in call_ids if cid in by_id]
+
+
+def reset_calls_to_uploaded(call_ids: list[int]) -> int:
+    """Put stopped calls back in the queue ('processing' → 'uploaded').
+
+    No error_msg: the Admin page shows any error_msg as a failure, and a call
+    the user stopped didn't fail. Rows that already left 'processing' are left alone.
+    """
+    if not call_ids:
+        return 0
+    placeholders = ",".join("?" * len(call_ids))
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            f"""
+            UPDATE calls
+            SET status = 'uploaded', processing_step = NULL, error_msg = NULL, updated_at = ?
+            WHERE status = 'processing' AND id IN ({placeholders})
+            """,
+            [_now(), *call_ids],
+        )
+    conn.close()
+    return cur.rowcount
 
 
 def get_call_by_id(call_id: int) -> dict | None:
@@ -261,8 +553,8 @@ def delete_call(call_id: int) -> int:
     with conn:
         conn.execute("DELETE FROM calls WHERE id = ?", (call_id,))
         conn.execute("DELETE FROM call_customer_links WHERE call_id = ?", (call_id,))
-    removed = _cleanup_orphan_cases(conn)
     conn.close()
+    removed = delete_orphan_cases()
     return removed
 
 
@@ -275,8 +567,8 @@ def delete_calls_bulk(call_ids: list[int]) -> int:
     with conn:
         conn.execute(f"DELETE FROM calls WHERE id IN ({placeholders})", call_ids)
         conn.execute(f"DELETE FROM call_customer_links WHERE call_id IN ({placeholders})", call_ids)
-    removed = _cleanup_orphan_cases(conn)
     conn.close()
+    removed = delete_orphan_cases()
     return removed
 
 
@@ -344,13 +636,29 @@ def recover_stale_processing(max_age_minutes: int) -> int:
     return cur.rowcount or 0
 
 
-def get_done_calls() -> list[dict]:
+def get_done_calls(limit: int | None = None, offset: int = 0) -> list[dict]:
+    """Return completed calls newest-first.
+
+    `limit=None` keeps the original behavior (return everything). Passing an int
+    caps the result for dashboards that need to stay responsive on large datasets.
+    """
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM calls WHERE status = 'done' ORDER BY created_at DESC"
-    ).fetchall()
+    sql = "SELECT * FROM calls WHERE status = 'done' ORDER BY created_at DESC"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = (int(limit), int(offset))
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def count_done_calls() -> int:
+    """Return total number of completed calls (used for 'X of Y' indicators)."""
+    conn = get_connection()
+    n = conn.execute("SELECT COUNT(*) FROM calls WHERE status = 'done'").fetchone()[0]
+    conn.close()
+    return int(n or 0)
 
 
 # ─── Customers ────────────────────────────────────────────────────────────────
@@ -360,11 +668,16 @@ def insert_customer(
     gender: str = None, date_of_birth: str = None, address: str = None,
     subdistrict: str = None, district: str = None, city_province: str = None,
     country: str = "Thailand", postcode: str = None,
+    nick_name: str = None, channel: str = None,
 ) -> int:
     """Insert a customer. If phone already exists, returns the existing customer's id
-    (idempotent — safe for seed scripts to re-run)."""
+    (idempotent — safe for seed scripts to re-run).
+
+    Hidden customers count as existing: `phone` is UNIQUE, so a soft-deleted row
+    still owns the number. The UI blocks this case earlier and offers a restore.
+    """
     if phone:
-        existing = get_customer_by_phone(phone)
+        existing = get_customer_by_phone(phone, include_deleted=True)
         if existing:
             return existing["id"]
     now = _now()
@@ -373,42 +686,179 @@ def insert_customer(
         cur = conn.execute(
             """INSERT INTO customers
                (first_name, last_name, phone, email, gender, date_of_birth,
-                address, subdistrict, district, city_province, country, postcode, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                address, subdistrict, district, city_province, country, postcode,
+                nick_name, channel, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+            + (" ON CONFLICT (phone) DO UPDATE SET phone=EXCLUDED.phone" if phone and database_backend.database_url() else ""),
             (first_name, last_name, phone, email, gender, date_of_birth,
-             address, subdistrict, district, city_province, country, postcode, now),
+             address, subdistrict, district, city_province, country, postcode,
+             nick_name, channel, now),
         )
     conn.close()
     return cur.lastrowid
 
 
-def get_all_customers() -> list[dict]:
+def get_all_customers(include_deleted: bool = False) -> list[dict]:
+    """Active customers. Hidden (soft-deleted) rows are excluded by default."""
+    where = "" if include_deleted else "WHERE deleted_at IS NULL"
     conn = get_connection()
-    rows = conn.execute("SELECT * FROM customers ORDER BY last_name, first_name").fetchall()
+    rows = conn.execute(
+        f"SELECT * FROM customers {where} ORDER BY last_name, first_name"
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_customer_by_phone(phone: str) -> dict | None:
+def get_deleted_customers() -> list[dict]:
+    """Hidden customers, newest hidden first — the 'trash' view."""
     conn = get_connection()
-    row = conn.execute("SELECT * FROM customers WHERE phone = ?", (phone,)).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM customers WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_customer_by_phone(phone: str, include_deleted: bool = False) -> dict | None:
+    """Look up by phone. `include_deleted` matters because `phone` is UNIQUE —
+    a hidden customer still owns their number, so the caller has to notice."""
+    extra = "" if include_deleted else "AND deleted_at IS NULL"
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT * FROM customers WHERE phone = ? {extra}", (phone,)
+    ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def get_customer_by_id(customer_id: int) -> dict | None:
+def get_customer_by_id(customer_id: int, include_deleted: bool = False) -> dict | None:
+    extra = "" if include_deleted else "AND deleted_at IS NULL"
     conn = get_connection()
-    row = conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
+    row = conn.execute(
+        f"SELECT * FROM customers WHERE id = ? {extra}", (customer_id,)
+    ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+# Columns the Admin data-entry page may patch. `id` and `created_at` are not
+# editable — everything else on the row is.
+CUSTOMER_EDITABLE_COLUMNS = (
+    "first_name", "last_name", "phone", "email", "gender", "date_of_birth",
+    "address", "subdistrict", "district", "city_province", "country", "postcode",
+    "nick_name", "channel",
+)
+
+
+def update_customer(customer_id: int, **fields) -> int:
+    """Patch editable customer columns. Unknown keys are ignored.
+
+    Returns the number of rows updated (0 when the id is unknown or nothing
+    editable was passed).
+    """
+    updates = {col: fields[col] for col in CUSTOMER_EDITABLE_COLUMNS if col in fields}
+    if not updates:
+        return 0
+    assignments = ", ".join(f"{col} = ?" for col in updates)
+    params = [*updates.values(), customer_id]
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(f"UPDATE customers SET {assignments} WHERE id = ?", params)
+        updated = cur.rowcount
+    conn.close()
+    return updated
+
+
+def count_customer_dependencies(customer_id: int) -> dict[str, int]:
+    """Rows that still reference this customer — checked before a delete."""
+    conn = get_connection()
+    counts = {
+        "warranties": conn.execute(
+            "SELECT COUNT(*) FROM warranty_registrations WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone()[0],
+        "calls": conn.execute(
+            "SELECT COUNT(*) FROM call_customer_links WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone()[0],
+        "cases": conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE customer_id = ?", (customer_id,)
+        ).fetchone()[0],
+    }
+    conn.close()
+    return counts
+
+
+def soft_delete_customer(customer_id: int, actor: str | None = None) -> dict[str, int]:
+    """Hide a customer instead of deleting the row.
+
+    Nothing is removed from the database: the customer and their warranty
+    registrations get a `deleted_at` stamp so they drop out of every default
+    query, while call links, cases and the calls themselves stay exactly as they
+    were. `restore_customer` puts everything back.
+
+    Returns {"customer": 0|1, "warranties": n, "deleted_at": timestamp}.
+    """
+    now = _now()
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE customers SET deleted_at = ?, deleted_by = ?
+               WHERE id = ? AND deleted_at IS NULL""",
+            (now, actor, customer_id),
+        )
+        hidden = cur.rowcount
+        warranties = 0
+        if hidden:
+            wcur = conn.execute(
+                """UPDATE warranty_registrations
+                   SET deleted_at = ?, deleted_by = ?, hidden_with_customer = 1
+                   WHERE customer_id = ? AND deleted_at IS NULL""",
+                (now, actor, customer_id),
+            )
+            warranties = wcur.rowcount or 0
+    conn.close()
+    return {"customer": hidden, "warranties": warranties, "deleted_at": now if hidden else None}
+
+
+def restore_customer(customer_id: int) -> dict[str, int]:
+    """Un-hide a customer, together with the warranties hidden in the same action.
+
+    Warranties an Admin hid separately keep their own `deleted_at` and stay
+    hidden — only the ones flagged `hidden_with_customer` come back.
+    """
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE customers SET deleted_at = NULL, deleted_by = NULL
+               WHERE id = ? AND deleted_at IS NOT NULL""",
+            (customer_id,),
+        )
+        restored = cur.rowcount
+        warranties = 0
+        if restored:
+            wcur = conn.execute(
+                """UPDATE warranty_registrations
+                   SET deleted_at = NULL, deleted_by = NULL, hidden_with_customer = 0
+                   WHERE customer_id = ? AND hidden_with_customer = 1""",
+                (customer_id,),
+            )
+            warranties = wcur.rowcount or 0
+    conn.close()
+    return {"customer": restored, "warranties": warranties}
 
 
 # ─── Warranty Registrations ───────────────────────────────────────────────────
 
-def get_warranty_by_registration(registration_no: str) -> dict | None:
+def get_warranty_by_registration(
+    registration_no: str, include_deleted: bool = False
+) -> dict | None:
+    """Look up by registration number, which is UNIQUE — so a hidden row still
+    owns its number and `include_deleted` decides whether the caller sees it."""
+    extra = "" if include_deleted else "AND deleted_at IS NULL"
     conn = get_connection()
     row = conn.execute(
-        "SELECT * FROM warranty_registrations WHERE registration_no = ?",
+        f"SELECT * FROM warranty_registrations WHERE registration_no = ? {extra}",
         (registration_no,),
     ).fetchone()
     conn.close()
@@ -423,10 +873,15 @@ def insert_warranty(
     warranty_period_months: int = 120, date_of_purchase: str = None,
     date_of_delivery: str = None, purchase_channel: str = None,
     order_number: str = None, expiry_date: str = None, remark: str = None,
+    ref_id: str = None, so_number: str = None, proof_path: str = None,
 ) -> int:
     """Insert a warranty registration. If registration_no already exists,
-    returns the existing id (idempotent — safe for seed scripts to re-run)."""
-    existing = get_warranty_by_registration(registration_no)
+    returns the existing id (idempotent — safe for seed scripts to re-run).
+
+    Hidden rows count as existing: `registration_no` is UNIQUE, so the number
+    stays taken. The UI blocks this earlier and offers a restore instead.
+    """
+    existing = get_warranty_by_registration(registration_no, include_deleted=True)
     if existing:
         return existing["id"]
     now = _now()
@@ -437,34 +892,156 @@ def insert_warranty(
                (registration_no, customer_id, channel, certificate_no, category, brand,
                 model, size, sku, serial_no, label_no, warranty_period_months,
                 date_of_purchase, date_of_delivery, purchase_channel, order_number,
-                expiry_date, remark, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                expiry_date, remark, ref_id, so_number, proof_path, status, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?)"""
+            + (" ON CONFLICT (registration_no) DO UPDATE SET registration_no=EXCLUDED.registration_no" if database_backend.database_url() else ""),
             (registration_no, customer_id, channel, certificate_no, category, brand,
              model, size, sku, serial_no, label_no, warranty_period_months,
              date_of_purchase, date_of_delivery, purchase_channel, order_number,
-             expiry_date, remark, now),
+             expiry_date, remark, ref_id, so_number, proof_path, now),
         )
     conn.close()
     return cur.lastrowid
 
 
-def get_warranties_by_customer(customer_id: int) -> list[dict]:
+def get_warranty_by_id(warranty_id: int, include_deleted: bool = False) -> dict | None:
+    extra = "" if include_deleted else "AND deleted_at IS NULL"
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT * FROM warranty_registrations WHERE id = ? {extra}", (warranty_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# Everything on the row except `id` and `created_at` may be corrected from the
+# Admin data-entry page, including which customer the registration belongs to.
+WARRANTY_EDITABLE_COLUMNS = (
+    "registration_no", "customer_id", "channel", "certificate_no", "category",
+    "brand", "model", "size", "sku", "serial_no", "label_no",
+    "warranty_period_months", "date_of_purchase", "date_of_delivery",
+    "purchase_channel", "order_number", "expiry_date", "remark",
+    "ref_id", "so_number", "proof_path",
+)
+
+
+def update_warranty(warranty_id: int, **fields) -> int:
+    """Patch editable warranty columns. Unknown keys are ignored."""
+    updates = {col: fields[col] for col in WARRANTY_EDITABLE_COLUMNS if col in fields}
+    if not updates:
+        return 0
+    assignments = ", ".join(f"{col} = ?" for col in updates)
+    params = [*updates.values(), warranty_id]
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            f"UPDATE warranty_registrations SET {assignments} WHERE id = ?", params
+        )
+        updated = cur.rowcount
+    conn.close()
+    return updated
+
+
+def soft_delete_warranty(warranty_id: int, actor: str | None = None) -> int:
+    """Hide a warranty registration; the row and its call link stay in the DB."""
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE warranty_registrations
+               SET deleted_at = ?, deleted_by = ?, hidden_with_customer = 0
+               WHERE id = ? AND deleted_at IS NULL""",
+            (_now(), actor, warranty_id),
+        )
+        hidden = cur.rowcount
+    conn.close()
+    return hidden
+
+
+def restore_warranty(warranty_id: int) -> int:
+    """Un-hide a warranty registration."""
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE warranty_registrations
+               SET deleted_at = NULL, deleted_by = NULL, hidden_with_customer = 0
+               WHERE id = ? AND deleted_at IS NOT NULL""",
+            (warranty_id,),
+        )
+        restored = cur.rowcount
+    conn.close()
+    return restored
+
+
+def set_warranty_status(warranty_id: int, status: str, actor: str | None = None) -> int:
+    """Active ↔ cancelled, like the company system's "Cancel" button.
+
+    Cancelling keeps the row visible with its status (it is a business state,
+    not a deletion); `cancelled_at` / `cancelled_by` record who did it.
+    """
+    if status not in ("active", "cancelled"):
+        raise ValueError(f"unknown warranty status {status!r}")
+    stamp = (_now(), actor) if status == "cancelled" else (None, None)
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE warranty_registrations
+               SET status = ?, cancelled_at = ?, cancelled_by = ?
+               WHERE id = ? AND COALESCE(status, 'active') != ?""",
+            (status, *stamp, warranty_id, status),
+        )
+        changed = cur.rowcount
+    conn.close()
+    return changed
+
+
+def get_warranties_by_so_number(so_number: str) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM warranty_registrations WHERE customer_id = ? ORDER BY date_of_purchase DESC",
+        """SELECT w.*, c.first_name, c.last_name, c.phone
+           FROM warranty_registrations w LEFT JOIN customers c ON c.id = w.customer_id
+           WHERE w.so_number = ? AND w.deleted_at IS NULL""",
+        (so_number,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_warranties_by_customer(customer_id: int, include_deleted: bool = False) -> list[dict]:
+    extra = "" if include_deleted else "AND deleted_at IS NULL"
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT * FROM warranty_registrations
+            WHERE customer_id = ? {extra}
+            ORDER BY date_of_purchase DESC""",
         (customer_id,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_all_warranties() -> list[dict]:
+def get_all_warranties(include_deleted: bool = False) -> list[dict]:
+    where = "" if include_deleted else "WHERE w.deleted_at IS NULL"
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT w.*, c.first_name, c.last_name, c.phone
+            FROM warranty_registrations w
+            LEFT JOIN customers c ON c.id = w.customer_id
+            {where}
+            ORDER BY w.date_of_purchase DESC"""
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_deleted_warranties() -> list[dict]:
+    """Hidden warranty registrations, newest hidden first — the 'trash' view."""
     conn = get_connection()
     rows = conn.execute(
         """SELECT w.*, c.first_name, c.last_name, c.phone
            FROM warranty_registrations w
            LEFT JOIN customers c ON c.id = w.customer_id
-           ORDER BY w.date_of_purchase DESC"""
+           WHERE w.deleted_at IS NOT NULL
+           ORDER BY w.deleted_at DESC"""
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -517,18 +1094,39 @@ def auto_link_call_by_phone(call_id: int, phone: str) -> dict | None:
 def link_call_customer(
     call_id: int, customer_id: int,
     warranty_id: int = None, matched_by: str = "manual",
+    *, case_plan: dict | None = None,
 ) -> int:
     now = _now()
-    conn = get_connection()
-    with conn:
+    with _locked_case_link(call_id) as (conn, call):
+        links = conn.execute("SELECT id, customer_id, warranty_id FROM call_customer_links WHERE call_id=? ORDER BY id",
+                             (call_id,)).fetchall()
+        if case_plan is not None:
+            if (not _valid_case_link_plan(case_plan) or case_plan["customer_id"] != customer_id
+                    or call["status"] != "done" or any(row["customer_id"] != customer_id for row in links)):
+                raise ValueError("invalid_manual_case_plan")
+            if warranty_id is not None and not conn.execute(
+                "SELECT id FROM warranty_registrations WHERE id=? AND customer_id=? AND deleted_at IS NULL",
+                (warranty_id, customer_id),
+            ).fetchone():
+                raise ValueError("invalid_manual_case_plan")
+            if case_plan["action"] == "link" and not conn.execute(
+                "SELECT id FROM cases WHERE id=? AND customer_id=? AND status IN ('open','follow_up')",
+                (case_plan["case_id"], customer_id),
+            ).fetchone():
+                raise ValueError("invalid_manual_case_plan")
+        for row in links:
+            if row["customer_id"] == customer_id and row["warranty_id"] == warranty_id:
+                return row["id"]
         cur = conn.execute(
-            """INSERT OR REPLACE INTO call_customer_links
+            """INSERT INTO call_customer_links
                (call_id, customer_id, warranty_id, matched_by, created_at)
                VALUES (?,?,?,?,?)""",
             (call_id, customer_id, warranty_id, matched_by, now),
         )
-    conn.close()
-    return cur.lastrowid
+        if call["status"] == "done" and call["case_id"] is None:
+            conn.execute("UPDATE calls SET case_link_plan=?, case_link_status='pending', case_link_error=NULL, case_link_updated_at=? WHERE id=?",
+                         (json.dumps(case_plan, sort_keys=True) if case_plan else None, now, call_id))
+        return cur.lastrowid
 
 
 def get_call_customer_link(call_id: int) -> dict | None:
@@ -545,6 +1143,183 @@ def get_call_customer_link(call_id: int) -> dict | None:
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+# ─── Sales orders ────────────────────────────────────────────────────────────
+
+def save_sales_order(header: dict, lines: list[dict], actor: str | None = None) -> tuple[int, bool]:
+    """Insert or update an SO by its number, replacing its lines.
+
+    Returns (id, created). A hidden SO that is saved again comes back.
+    """
+    values = {col: header.get(col) for col in SO_HEADER_COLUMNS}
+    if not values["so_number"]:
+        raise ValueError("so_number is required")
+    now = _now()
+    conn = get_connection()
+    with conn:
+        if database_backend.database_url():
+            conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", ("sales_order:" + values["so_number"],))
+        row = conn.execute(
+            "SELECT id FROM sales_orders WHERE so_number = ?", (values["so_number"],)
+        ).fetchone()
+        customer_id = header.get("customer_id")
+        if row:
+            so_id, created = row["id"], False
+            assignments = ", ".join(f"{col} = ?" for col in values)
+            conn.execute(
+                f"""UPDATE sales_orders SET {assignments}, customer_id = ?, updated_at = ?,
+                    deleted_at = NULL, deleted_by = NULL WHERE id = ?""",
+                (*values.values(), customer_id, now, so_id),
+            )
+            conn.execute("DELETE FROM sales_order_lines WHERE sales_order_id = ?", (so_id,))
+        else:
+            cols = ", ".join(values)
+            marks = ", ".join("?" for _ in values)
+            cur = conn.execute(
+                f"""INSERT INTO sales_orders ({cols}, customer_id, created_at, updated_at, created_by)
+                    VALUES ({marks}, ?, ?, ?, ?)""",
+                (*values.values(), customer_id, now, now, actor),
+            )
+            so_id, created = cur.lastrowid, True
+        for position, line in enumerate(lines, 1):
+            line_values = {col: line.get(col) for col in SO_LINE_COLUMNS}
+            line_values["line_no"] = line_values["line_no"] or position
+            conn.execute(
+                f"""INSERT INTO sales_order_lines (sales_order_id, {", ".join(line_values)})
+                    VALUES (?, {", ".join("?" for _ in line_values)})""",
+                (so_id, *line_values.values()),
+            )
+    conn.close()
+    return so_id, created
+
+
+def get_sales_order(so_id: int | None = None, so_number: str | None = None,
+                    include_deleted: bool = False) -> dict | None:
+    """One SO with its lines under "lines", plus the linked customer's name."""
+    where, param = ("so.id = ?", so_id) if so_id is not None else ("so.so_number = ?", so_number)
+    extra = "" if include_deleted else "AND so.deleted_at IS NULL"
+    conn = get_connection()
+    row = conn.execute(
+        f"""SELECT so.*, c.first_name, c.last_name, c.phone AS customer_phone
+            FROM sales_orders so LEFT JOIN customers c ON c.id = so.customer_id
+            WHERE {where} {extra}""",
+        (param,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    order = dict(row)
+    order["lines"] = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM sales_order_lines WHERE sales_order_id = ? ORDER BY line_no, id",
+            (order["id"],),
+        ).fetchall()
+    ]
+    conn.close()
+    return order
+
+
+def _so_search_sql(search: str | None, customer_id: int | None, include_deleted: bool) -> tuple[str, list]:
+    where, params = [], []
+    if not include_deleted:
+        where.append("so.deleted_at IS NULL")
+    if customer_id is not None:
+        where.append("so.customer_id = ?")
+        params.append(customer_id)
+    if search:
+        like = f"%{search.strip()}%"
+        where.append(
+            "(so.so_number LIKE ? OR so.sell_to_name LIKE ? OR so.ship_to_name LIKE ? "
+            "OR so.ship_to_phone LIKE ? OR so.external_doc LIKE ? OR so.customer_po_no LIKE ? "
+            "OR EXISTS (SELECT 1 FROM sales_order_lines l WHERE l.sales_order_id = so.id "
+            "AND (l.item_no LIKE ? OR l.description LIKE ?)))"
+        )
+        params.extend([like] * 8)
+    return ("WHERE " + " AND ".join(where)) if where else "", params
+
+
+def list_sales_orders(search: str | None = None, customer_id: int | None = None,
+                      limit: int | None = None, offset: int = 0,
+                      include_deleted: bool = False) -> list[dict]:
+    """SO headers newest first (by order date), with line count and customer name."""
+    where_sql, params = _so_search_sql(search, customer_id, include_deleted)
+    sql = f"""SELECT so.*, c.first_name, c.last_name,
+                     (SELECT COUNT(*) FROM sales_order_lines l WHERE l.sales_order_id = so.id) AS line_count
+              FROM sales_orders so LEFT JOIN customers c ON c.id = so.customer_id
+              {where_sql}
+              ORDER BY COALESCE(so.order_date, so.document_date, so.created_at) DESC, so.id DESC"""
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params += [int(limit), int(offset)]
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_sales_orders(search: str | None = None, customer_id: int | None = None,
+                       include_deleted: bool = False) -> int:
+    where_sql, params = _so_search_sql(search, customer_id, include_deleted)
+    conn = get_connection()
+    n = conn.execute(f"SELECT COUNT(*) FROM sales_orders so {where_sql}", params).fetchone()[0]
+    conn.close()
+    return int(n or 0)
+
+
+def get_deleted_sales_orders() -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM sales_orders WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def soft_delete_sales_order(so_id: int, actor: str | None = None) -> int:
+    """Hide an SO (the row and its lines stay — same policy as customers)."""
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            "UPDATE sales_orders SET deleted_at = ?, deleted_by = ? WHERE id = ? AND deleted_at IS NULL",
+            (_now(), actor, so_id),
+        )
+        hidden = cur.rowcount
+    conn.close()
+    return hidden
+
+
+def restore_sales_order(so_id: int) -> int:
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            "UPDATE sales_orders SET deleted_at = NULL, deleted_by = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+            (so_id,),
+        )
+        restored = cur.rowcount
+    conn.close()
+    return restored
+
+
+def get_sales_orders_for_customers(customer_ids: list[int]) -> dict[int, list[dict]]:
+    """{customer_id: [SO headers newest first]} — for the case dialog / customer page."""
+    ids = sorted({int(i) for i in customer_ids if i})
+    if not ids:
+        return {}
+    marks = ", ".join("?" for _ in ids)
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT so.*, (SELECT COUNT(*) FROM sales_order_lines l WHERE l.sales_order_id = so.id) AS line_count
+            FROM sales_orders so
+            WHERE so.customer_id IN ({marks}) AND so.deleted_at IS NULL
+            ORDER BY COALESCE(so.order_date, so.document_date, so.created_at) DESC""",
+        ids,
+    ).fetchall()
+    conn.close()
+    grouped: dict[int, list[dict]] = {i: [] for i in ids}
+    for row in rows:
+        grouped[row["customer_id"]].append(dict(row))
+    return grouped
 
 
 # ─── Cases ───────────────────────────────────────────────────────────────────
@@ -600,6 +1375,80 @@ def get_case_by_id(case_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_case_detail(case_id: int) -> dict | None:
+    """One case plus its customer's name/phone and call count (for the case
+    panel and the Discord message)."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT cs.*, c.first_name, c.last_name, c.phone,
+                  (SELECT COUNT(*) FROM calls cl WHERE cl.case_id = cs.id) AS call_count
+           FROM cases cs
+           LEFT JOIN customers c ON c.id = cs.customer_id
+           WHERE cs.id = ?""",
+        (case_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def claim_case(case_id: int, username: str, name: str) -> bool:
+    """Make `username` the owner of an unclaimed, not-closed case.
+
+    The check and the write are one UPDATE, so two people pressing the button
+    at the same moment cannot both win: the second finds `assignee_username`
+    already set and gets False.
+    """
+    now = _now()
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE cases
+               SET assignee_username = ?, assignee_name = ?, assigned_at = ?, updated_at = ?
+               WHERE id = ? AND assignee_username IS NULL AND status != 'closed'""",
+            (username, name, now, now, case_id),
+        )
+    conn.close()
+    return cur.rowcount == 1
+
+
+def release_case(case_id: int, expected_username: str) -> bool:
+    """Clear the owner, but only if it is still `expected_username` — a page
+    that went stale while someone else re-claimed the case changes nothing."""
+    now = _now()
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE cases
+               SET assignee_username = NULL, assignee_name = NULL, assigned_at = NULL,
+                   updated_at = ?
+               WHERE id = ? AND lower(assignee_username) = lower(?)""",
+            (now, case_id, expected_username),
+        )
+    conn.close()
+    return cur.rowcount == 1
+
+
+def set_case_status_as_assignee(case_id: int, status: str, username: str, name: str) -> bool:
+    """Change a case's status on behalf of its owner.
+
+    The owner check lives in the WHERE clause, so it holds even when the
+    page that sent the request is out of date. Closing stamps `closed_by` /
+    `closed_at`; any other status clears them.
+    """
+    now = _now()
+    closed_by, closed_at = (name, now) if status == "closed" else (None, None)
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """UPDATE cases
+               SET status = ?, closed_by = ?, closed_at = ?, updated_at = ?
+               WHERE id = ? AND lower(assignee_username) = lower(?)""",
+            (status, closed_by, closed_at, now, case_id, username),
+        )
+    conn.close()
+    return cur.rowcount == 1
 
 
 def latest_call_time_in_case(case_id: int) -> str | None:
@@ -659,9 +1508,10 @@ def get_cases_by_customer(customer_id: int) -> list[dict]:
 
 
 def get_open_cases_by_customer(customer_id: int) -> list[dict]:
+    aggregate = "string_agg(c.id::text, ',' ORDER BY c.id)" if database_backend.database_url() else "GROUP_CONCAT(c.id)"
     conn = get_connection()
     rows = conn.execute(
-        """SELECT cs.*, GROUP_CONCAT(c.id) as call_ids
+        f"""SELECT cs.*, {aggregate} as call_ids
            FROM cases cs
            LEFT JOIN calls c ON c.case_id = cs.id
            WHERE cs.customer_id = ? AND cs.status IN ('open', 'follow_up')
@@ -671,6 +1521,32 @@ def get_open_cases_by_customer(customer_id: int) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_calls_for_cases(case_ids: list[int]) -> dict[int, list[dict]]:
+    """{case_id: [calls oldest-first]} for a page of cases, in one query.
+
+    Lets the case list say what each case is about (summary, next step,
+    urgency) without a query per row.
+    """
+    ids = sorted({int(i) for i in case_ids})
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT id, case_id, filename, summary, topic, topic_detail, sentiment,
+                   anomaly_detected, anomaly_reason, anomaly_severity,
+                   agent_performance, transcript, created_at
+            FROM calls WHERE case_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC""",
+        ids,
+    ).fetchall()
+    conn.close()
+    grouped: dict[int, list[dict]] = {case_id: [] for case_id in ids}
+    for row in rows:
+        grouped[row["case_id"]].append(dict(row))
+    return grouped
 
 
 def get_calls_by_case(case_id: int) -> list[dict]:
@@ -683,20 +1559,92 @@ def get_calls_by_case(case_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all_cases() -> list[dict]:
+def _case_filters(
+    status: str | None,
+    search: str | None,
+    assignee: str | None,
+    unassigned: bool,
+) -> tuple[str, list]:
+    """WHERE clause shared by `get_all_cases` and `count_cases`."""
+    where: list[str] = []
+    params: list = []
+    if status:
+        where.append("cs.status = ?")
+        params.append(status)
+    if search:
+        like = f"%{search.strip()}%"
+        where.append(
+            "(cs.subject LIKE ? OR c.first_name LIKE ? OR "
+            "c.last_name LIKE ? OR c.phone LIKE ? OR cs.assignee_name LIKE ?)"
+        )
+        params.extend([like, like, like, like, like])
+    if assignee:
+        where.append("lower(cs.assignee_username) = lower(?)")
+        params.append(assignee)
+    if unassigned:
+        where.append("cs.assignee_username IS NULL")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    return where_sql, params
+
+
+def get_all_cases(
+    limit: int | None = None,
+    offset: int = 0,
+    status: str | None = None,
+    search: str | None = None,
+    assignee: str | None = None,
+    unassigned: bool = False,
+) -> list[dict]:
+    """Return cases newest-first.
+
+    Default behavior (no kwargs) is unchanged — returns every case. Optional
+    `limit`, `status`, and `search` let the dashboard stay responsive when the
+    cases table grows large (search matches subject, customer name, phone or
+    assignee). `assignee` keeps one person's cases; `unassigned` keeps the
+    ones nobody has claimed yet.
+    """
+    where_sql, params = _case_filters(status, search, assignee, unassigned)
+
+    sql = f"""
+        SELECT cs.*,
+               c.first_name, c.last_name, c.phone,
+               COUNT(cl.id) as call_count
+        FROM cases cs
+        LEFT JOIN customers c ON c.id = cs.customer_id
+        LEFT JOIN calls cl ON cl.case_id = cs.id
+        {where_sql}
+        GROUP BY cs.id, c.id
+        ORDER BY cs.updated_at DESC
+    """
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
+
     conn = get_connection()
-    rows = conn.execute(
-        """SELECT cs.*,
-                  c.first_name, c.last_name, c.phone,
-                  COUNT(cl.id) as call_count
-           FROM cases cs
-           LEFT JOIN customers c ON c.id = cs.customer_id
-           LEFT JOIN calls cl ON cl.case_id = cs.id
-           GROUP BY cs.id
-           ORDER BY cs.updated_at DESC"""
-    ).fetchall()
+    rows = conn.execute(sql, tuple(params)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def count_cases(
+    status: str | None = None,
+    search: str | None = None,
+    assignee: str | None = None,
+    unassigned: bool = False,
+) -> int:
+    """Return number of cases matching optional status/search filters."""
+    where_sql, params = _case_filters(status, search, assignee, unassigned)
+
+    conn = get_connection()
+    n = conn.execute(
+        f"""SELECT COUNT(DISTINCT cs.id)
+            FROM cases cs
+            LEFT JOIN customers c ON c.id = cs.customer_id
+            {where_sql}""",
+        tuple(params),
+    ).fetchone()[0]
+    conn.close()
+    return int(n or 0)
 
 
 def get_calls_by_customer(customer_id: int) -> list[dict]:
@@ -715,16 +1663,23 @@ def get_calls_by_customer(customer_id: int) -> list[dict]:
 
 
 def get_case_counts() -> dict:
-    """Return counts of cases by status: {'open': n, 'follow_up': n, 'closed': n, 'total': n}."""
+    """Return counts of cases by status: {'open': n, 'follow_up': n, 'closed': n, 'total': n}.
+
+    `unassigned` counts the not-yet-closed cases nobody has claimed.
+    """
     conn = get_connection()
     rows = conn.execute(
         "SELECT status, COUNT(*) AS n FROM cases GROUP BY status"
     ).fetchall()
+    unassigned = conn.execute(
+        "SELECT COUNT(*) FROM cases WHERE status != 'closed' AND assignee_username IS NULL"
+    ).fetchone()[0]
     conn.close()
     counts = {r["status"]: r["n"] for r in rows}
     counts["total"] = sum(counts.values())
     for s in ("open", "follow_up", "closed"):
         counts.setdefault(s, 0)
+    counts["unassigned"] = unassigned
     return counts
 
 
@@ -747,3 +1702,377 @@ def get_previous_call_summaries_for_customer(customer_id: int, exclude_call_id: 
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Audit trail ──────────────────────────────────────────────────────────
+#
+# Append-only history of who changed what. Rows are never updated or deleted,
+# which is also why customers and warranties are hidden rather than removed —
+# a log that points at rows which no longer exist explains nothing.
+
+
+def log_action(
+    action: str,
+    entity: str,
+    entity_id: int | None = None,
+    entity_label: str | None = None,
+    actor: str | None = None,
+    actor_role: str | None = None,
+    changes: dict | None = None,
+) -> int:
+    """Append one row to the audit trail.
+
+    `action` is create / update / delete / restore, `entity` is the kind of row
+    that changed (customer, warranty, ...), and `changes` is a small dict that is
+    stored as JSON — {field: [before, after]} for an update, a snapshot of the
+    identifying fields otherwise. Nothing here is ever updated or deleted.
+    """
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO audit_log
+               (actor, actor_role, action, entity, entity_id, entity_label, changes, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                actor,
+                actor_role,
+                action,
+                entity,
+                entity_id,
+                entity_label,
+                json.dumps(changes, ensure_ascii=False) if changes else None,
+                _now(),
+            ),
+        )
+    conn.close()
+    return cur.lastrowid
+
+
+def get_audit_log(
+    entity: str | None = None,
+    entity_id: int | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Audit entries, newest first, optionally narrowed to one entity or row."""
+    clauses = []
+    params: list = []
+    if entity:
+        clauses.append("entity = ?")
+        params.append(entity)
+    if entity_id is not None:
+        clauses.append("entity_id = ?")
+        params.append(entity_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+
+    conn = get_connection()
+    rows = conn.execute(
+        f"SELECT * FROM audit_log {where} ORDER BY id DESC LIMIT ?", params
+    ).fetchall()
+    conn.close()
+
+    entries = []
+    for row in rows:
+        entry = dict(row)
+        try:
+            entry["changes"] = json.loads(entry["changes"]) if entry["changes"] else {}
+        except json.JSONDecodeError:  # pragma: no cover - defensive
+            entry["changes"] = {}
+        entries.append(entry)
+    return entries
+
+
+def count_audit_entries(entity: str | None = None) -> int:
+    conn = get_connection()
+    if entity:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE entity = ?", (entity,)
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    conn.close()
+    return int(row[0] or 0)
+
+
+# ── Users (staff login accounts) ─────────────────────────────────────────
+#
+# Password hashes are PBKDF2-SHA256 strings produced by smartvoice.auth —
+# this module never sees a plaintext password.
+
+
+def create_user(
+    username: str,
+    display_name: str,
+    role: str,
+    password_hash: str,
+    is_active: bool = True,
+) -> int:
+    """Insert a staff account. Raises sqlite3.IntegrityError on duplicate username."""
+    now = _now()
+    conn = get_connection()
+    with conn:
+        cur = conn.execute(
+            """
+            INSERT INTO users (
+                username, display_name, role, password_hash,
+                is_active, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (username.strip(), display_name.strip(), role,
+             password_hash, 1 if is_active else 0, now, now),
+        )
+        new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def get_user_by_username(username: str) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM users WHERE lower(username) = lower(?)",
+        ((username or "").strip(),),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user_by_id(user_id: int) -> dict | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_all_users() -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM users ORDER BY is_active DESC, role, lower(username)"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_users() -> int:
+    conn = get_connection()
+    n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return int(n)
+
+
+def count_active_admins(exclude_user_id: int | None = None) -> int:
+    """Number of enabled Admin accounts, optionally ignoring one user id."""
+    conn = get_connection()
+    query = "SELECT COUNT(*) FROM users WHERE is_active = 1 AND role = 'Admin'"
+    params: list = []
+    if exclude_user_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_user_id)
+    n = conn.execute(query, params).fetchone()[0]
+    conn.close()
+    return int(n)
+
+
+def update_user(
+    user_id: int,
+    display_name: str | None = None,
+    role: str | None = None,
+    is_active: bool | None = None,
+) -> None:
+    """Patch the editable profile fields of a user. Unset args are left as-is."""
+    fields: list[str] = []
+    params: list = []
+    if display_name is not None:
+        fields.append("display_name = ?")
+        params.append(display_name.strip())
+    if role is not None:
+        fields.append("role = ?")
+        params.append(role)
+    if is_active is not None:
+        fields.append("is_active = ?")
+        params.append(1 if is_active else 0)
+    if not fields:
+        return
+
+    fields.append("updated_at = ?")
+    params.extend([_now(), user_id])
+    conn = get_connection()
+    with conn:
+        _check_admin_removal(conn, user_id, role, is_active)
+        conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", params)
+    conn.close()
+
+
+def update_user_password(user_id: int, password_hash: str) -> None:
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (password_hash, _now(), user_id),
+        )
+    conn.close()
+
+
+def touch_user_login(user_id: int) -> None:
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "UPDATE users SET last_login_at = ? WHERE id = ?", (_now(), user_id)
+        )
+    conn.close()
+
+
+def delete_user(user_id: int) -> int:
+    conn = get_connection()
+    with conn:
+        _check_admin_removal(conn, user_id, None, False)
+        cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        deleted = cur.rowcount
+    conn.close()
+    return deleted
+
+
+def _check_admin_removal(conn, user_id, role, active):
+    if database_backend.database_url():
+        conn.execute("SELECT pg_advisory_xact_lock(724613003)")
+    elif not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute("SELECT role, is_active FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row or row["role"] != "Admin" or not row["is_active"]:
+        return
+    if (role is None or role == "Admin") and (active is None or active):
+        return
+    others = conn.execute("SELECT COUNT(*) FROM users WHERE role='Admin' AND is_active=1 AND id<>?", (user_id,)).fetchone()[0]
+    if not others:
+        raise LastAdminError("At least one active Admin account must remain")
+
+
+def _migrate_case_linking(conn) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(calls)").fetchall()}
+    expected = {"case_link_status", "case_link_plan", "case_link_error", "case_link_updated_at"}
+    if expected <= columns:
+        return
+    if expected & columns:
+        raise sqlite3.OperationalError("Incomplete case linking migration")
+    path = Path(__file__).resolve().parent.parent / "migrations" / "002_case_linking.sql"
+    for statement in path.read_text(encoding="utf-8").split(";"):
+        if statement.strip():
+            conn.execute(statement)
+
+
+@contextmanager
+def _locked_case_link(call_id: int):
+    conn = get_connection()
+    try:
+        with conn:
+            if not database_backend.database_url():
+                conn.execute("BEGIN IMMEDIATE")
+            suffix = " FOR UPDATE" if database_backend.database_url() else ""
+            row = conn.execute("SELECT * FROM calls WHERE id = ?" + suffix, (call_id,)).fetchone()
+            if row is None:
+                raise ValueError("call_not_found")
+            yield conn, dict(row)
+    finally:
+        conn.close()
+
+
+def _valid_case_link_plan(plan) -> bool:
+    if not isinstance(plan, dict):
+        return False
+    action = plan.get("action")
+    if not isinstance(action, str):
+        return False
+    keys = {"action", "customer_id"} if action == "create" else {"action", "customer_id", "case_id"}
+    return (
+        action in {"create", "link"} and set(plan) == keys
+        and type(plan.get("customer_id")) is int and plan["customer_id"] > 0
+        and (action == "create" or (type(plan.get("case_id")) is int and plan["case_id"] > 0))
+    )
+
+
+def save_case_link_plan(call_id: int, plan: dict) -> None:
+    if not _valid_case_link_plan(plan):
+        raise ValueError("invalid_plan")
+    with _locked_case_link(call_id) as (conn, call):
+        if call["status"] != "done":
+            raise ValueError("analysis_not_done")
+        if call["case_id"] is not None or call["case_link_plan"] is not None:
+            return
+        conn.execute(
+            "UPDATE calls SET case_link_plan=?, case_link_status='pending', case_link_error=NULL, case_link_updated_at=? WHERE id=?",
+            (json.dumps(plan, sort_keys=True), _now(), call_id),
+        )
+
+
+def record_case_link_failure(call_id: int, code: str = "planning_failed") -> None:
+    if code not in {"planning_failed", "write_failed"}:
+        raise ValueError("invalid_error_code")
+    with _locked_case_link(call_id) as (conn, call):
+        if call["status"] == "done" and call["case_link_status"] in {"pending", "failed"}:
+            _set_case_link_state(conn, call_id, "failed", code)
+
+
+def _set_case_link_state(conn, call_id: int, status: str, error: str | None = None) -> str:
+    conn.execute(
+        "UPDATE calls SET case_link_status=?, case_link_error=?, case_link_updated_at=? WHERE id=?",
+        (status, error, _now(), call_id),
+    )
+    return status
+
+
+def retry_case_link(call_id: int) -> str:
+    try:
+        with _locked_case_link(call_id) as (conn, call):
+            if call["status"] != "done":
+                raise ValueError("analysis_not_done")
+            if call["case_link_status"] == "failed" and call["case_link_error"] in {"missing_plan", "invalid_plan", "stale_plan", "customer_changed"}:
+                return "failed"
+            links = conn.execute("SELECT DISTINCT customer_id FROM call_customer_links WHERE call_id=?", (call_id,)).fetchall()
+            if not links and call["case_id"] is None and call["case_link_plan"] is None and call["case_link_status"] == "not_required":
+                return "not_required"
+            if len(links) != 1:
+                return _set_case_link_state(conn, call_id, "failed", "customer_changed")
+            customer_id = links[0][0]
+            suffix = " FOR UPDATE" if database_backend.database_url() else ""
+            customer = conn.execute("SELECT id, deleted_at FROM customers WHERE id=?" + suffix, (customer_id,)).fetchone()
+            if not customer or customer["deleted_at"] is not None:
+                return _set_case_link_state(conn, call_id, "failed", "customer_changed")
+            if call["case_id"] is not None:
+                case = conn.execute("SELECT customer_id FROM cases WHERE id=?" + suffix, (call["case_id"],)).fetchone()
+                if case and case["customer_id"] == customer_id:
+                    if call["case_link_status"] == "linked" and call["case_link_error"] is None:
+                        return "linked"
+                    return _set_case_link_state(conn, call_id, "linked")
+                return _set_case_link_state(conn, call_id, "failed", "stale_plan")
+            if call["case_link_status"] == "linked":
+                return _set_case_link_state(conn, call_id, "failed", "stale_plan")
+            if call["case_link_plan"] is None:
+                return _set_case_link_state(conn, call_id, "failed", "missing_plan")
+            try:
+                plan = json.loads(call["case_link_plan"])
+            except (ValueError, TypeError):
+                plan = None
+            if not _valid_case_link_plan(plan):
+                return _set_case_link_state(conn, call_id, "failed", "invalid_plan")
+            if plan["customer_id"] != customer_id:
+                return _set_case_link_state(conn, call_id, "failed", "customer_changed")
+            now = _now()
+            if plan["action"] == "link":
+                case_id = plan["case_id"]
+                case = conn.execute("SELECT customer_id, status FROM cases WHERE id=?" + suffix, (case_id,)).fetchone()
+                if not case or case["customer_id"] != customer_id or case["status"] not in {"open", "follow_up"}:
+                    return _set_case_link_state(conn, call_id, "failed", "stale_plan")
+                conn.execute("UPDATE cases SET status='follow_up', updated_at=? WHERE id=?", (now, case_id))
+            else:
+                case_id = conn.execute(
+                    "INSERT INTO cases (customer_id, subject, status, created_at, updated_at) VALUES (?, ?, 'open', ?, ?)",
+                    (customer_id, call["topic"] or "เรื่องทั่วไป", now, now),
+                ).lastrowid
+            conn.execute("UPDATE calls SET case_id=?, updated_at=? WHERE id=?", (case_id, now, call_id))
+            return _set_case_link_state(conn, call_id, "linked")
+    except sqlite3.Error:
+        try:
+            record_case_link_failure(call_id, "write_failed")
+        except sqlite3.Error:
+            pass
+        return "failed"

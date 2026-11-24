@@ -4,6 +4,7 @@ These tests use a temporary SQLite file per test to avoid touching prod data.
 """
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,7 @@ class TestSchema(DBTestCase):
         }
         conn.close()
         for expected in ("calls", "customers", "warranty_registrations",
-                          "call_customer_links", "cases"):
+                          "call_customer_links", "cases", "users"):
             self.assertIn(expected, tables)
 
     def test_calls_has_new_columns(self):
@@ -50,7 +51,8 @@ class TestSchema(DBTestCase):
         # Columns added via _migrate
         for expected in ("case_id", "customer_phone", "sentiment_reason",
                           "anomaly_severity", "processing_step",
-                          "uploaded_by", "uploaded_by_role"):
+                          "uploaded_by", "uploaded_by_role",
+                          "topic_detail"):
             self.assertIn(expected, cols)
 
     def test_foreign_keys_are_enabled(self):
@@ -82,6 +84,87 @@ class TestIdempotentInserts(DBTestCase):
         self.assertEqual(wid1, wid2)
 
 
+class TestScaleFriendlyHelpers(DBTestCase):
+    """Admin page must stay responsive at 10K+ uploads — these helpers replace
+    a full-table scan with SQL-side counts + scoped fetches."""
+
+    def _seed(self):
+        # 3 uploaded, 1 processing, 2 done, 1 error
+        for i in range(3):
+            db.insert_call(f"u_{i}.wav", f"hU{i}", f"/u_{i}.wav")
+        cid = db.insert_call("p.wav", "hP", "/p.wav")
+        db.update_call_status(cid, "processing")
+        for i in range(2):
+            cid = db.insert_call(f"d_{i}.wav", f"hD{i}", f"/d_{i}.wav")
+            db.update_call_status(cid, "done")
+        cid = db.insert_call("e.wav", "hE", "/e.wav")
+        db.update_call_status(cid, "error", error_msg="boom")
+
+    def test_count_calls_by_status_returns_all_buckets(self):
+        self._seed()
+        counts = db.count_calls_by_status()
+        self.assertEqual(counts["uploaded"], 3)
+        self.assertEqual(counts["processing"], 1)
+        self.assertEqual(counts["done"], 2)
+        self.assertEqual(counts["error"], 1)
+        self.assertEqual(counts["total"], 7)
+
+    def test_count_calls_empty_database(self):
+        counts = db.count_calls_by_status()
+        self.assertEqual(counts, {"uploaded": 0, "processing": 0, "done": 0,
+                                  "error": 0, "total": 0})
+
+    def test_get_all_calls_limit_caps_rows(self):
+        self._seed()
+        self.assertEqual(len(db.get_all_calls(limit=3)), 3)
+
+    def test_get_all_calls_no_limit_returns_everything(self):
+        # Backward-compat: callers that don't pass limit still get the full list
+        self._seed()
+        self.assertEqual(len(db.get_all_calls()), 7)
+
+    def test_get_pending_call_ids_returns_only_uploaded(self):
+        self._seed()
+        ids = db.get_pending_call_ids()
+        self.assertEqual(len(ids), 3)
+        # All returned ids must really be 'uploaded' status
+        for cid in ids:
+            self.assertEqual(db.get_call_by_id(cid)["status"], "uploaded")
+
+    def test_get_processing_calls_returns_only_processing(self):
+        self._seed()
+        rows = db.get_processing_calls()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "processing")
+
+
+class TestUpdateCallResultsTopicDetail(DBTestCase):
+    """topic_detail must persist (drill-down for "แจ้งปัญหาสินค้า" — Omazz request)."""
+
+    def _seed(self) -> int:
+        cid = db.insert_call("c.wav", "hX", "/c.wav")
+        return cid
+
+    def test_persists_topic_detail(self):
+        cid = self._seed()
+        db.update_call_results(
+            call_id=cid, transcript="t", summary="s", sentiment="neutral",
+            topic="แจ้งปัญหาสินค้า", topic_detail="ผ้าขาด/ผ้าหุ้มชำรุด",
+        )
+        row = db.get_call_by_id(cid)
+        self.assertEqual(row["topic_detail"], "ผ้าขาด/ผ้าหุ้มชำรุด")
+        self.assertEqual(row["status"], "done")
+
+    def test_default_topic_detail_is_empty(self):
+        cid = self._seed()
+        db.update_call_results(
+            call_id=cid, transcript="t", summary="s", sentiment="neutral",
+            topic="สอบถามข้อมูลสินค้า",
+        )
+        row = db.get_call_by_id(cid)
+        self.assertEqual(row["topic_detail"] or "", "")
+
+
 class TestCaseCounts(DBTestCase):
     def test_empty_database(self):
         counts = db.get_case_counts()
@@ -101,6 +184,127 @@ class TestCaseCounts(DBTestCase):
         self.assertEqual(counts["open"], 2)
         self.assertEqual(counts["follow_up"], 1)
         self.assertEqual(counts["closed"], 1)
+
+
+class TestGetDoneCallsPagination(DBTestCase):
+    """Regression: dashboard must be able to cap rows on large datasets without
+    breaking the no-arg behavior that other callers (and older code) rely on."""
+
+    def _seed_done_calls(self, n: int) -> list[int]:
+        ids = []
+        for i in range(n):
+            cid = db.insert_call(f"call_{i}.wav", f"hash_{i}", f"/fake_{i}.wav")
+            db.update_call_status(cid, "done")
+            ids.append(cid)
+        return ids
+
+    def test_no_arg_returns_all(self):
+        self._seed_done_calls(7)
+        self.assertEqual(len(db.get_done_calls()), 7)
+
+    def test_limit_caps_rows(self):
+        self._seed_done_calls(10)
+        self.assertEqual(len(db.get_done_calls(limit=3)), 3)
+
+    def test_limit_larger_than_dataset_is_safe(self):
+        self._seed_done_calls(2)
+        self.assertEqual(len(db.get_done_calls(limit=100)), 2)
+
+    def test_offset_skips_rows(self):
+        self._seed_done_calls(5)
+        page1 = db.get_done_calls(limit=2, offset=0)
+        page2 = db.get_done_calls(limit=2, offset=2)
+        # Pages should not overlap
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        self.assertNotEqual(page1[0]["id"], page2[0]["id"])
+
+    def test_only_done_status_returned(self):
+        # uploaded + processing must be excluded
+        db.insert_call("uploaded.wav", "h1", "/u.wav")
+        cid = db.insert_call("done.wav", "h2", "/d.wav")
+        db.update_call_status(cid, "done")
+        cid2 = db.insert_call("proc.wav", "h3", "/p.wav")
+        db.update_call_status(cid2, "processing")
+        rows = db.get_done_calls()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["filename"], "done.wav")
+
+    def test_count_done_calls(self):
+        self.assertEqual(db.count_done_calls(), 0)
+        self._seed_done_calls(4)
+        db.insert_call("uploaded.wav", "u1", "/u.wav")  # not done
+        self.assertEqual(db.count_done_calls(), 4)
+
+
+class TestGetAllCasesFilters(DBTestCase):
+    """Regression: Case Management dashboard must be filterable + paginated
+    for installs with thousands of cases. Default no-arg behavior is kept."""
+
+    def _seed(self):
+        c1 = db.insert_customer(first_name="สุภาพร", last_name="จันทร์แก้ว", phone="0800000001")
+        c2 = db.insert_customer(first_name="ธนวัฒน์", last_name="รักษาศิลป์", phone="0800000002")
+        # 3 open, 2 follow_up, 1 closed
+        db.create_case(c1, "แจ้งปัญหาที่นอน", status="open")
+        db.create_case(c1, "สอบถามจัดส่ง", status="open")
+        db.create_case(c2, "เปลี่ยนคืน", status="open")
+        db.create_case(c1, "ติดตามเคลม", status="follow_up")
+        db.create_case(c2, "นัดช่าง", status="follow_up")
+        db.create_case(c2, "ปิดเรื่องแล้ว", status="closed")
+
+    def test_no_arg_returns_all(self):
+        self._seed()
+        self.assertEqual(len(db.get_all_cases()), 6)
+
+    def test_status_filter(self):
+        self._seed()
+        self.assertEqual(len(db.get_all_cases(status="open")), 3)
+        self.assertEqual(len(db.get_all_cases(status="follow_up")), 2)
+        self.assertEqual(len(db.get_all_cases(status="closed")), 1)
+
+    def test_search_matches_subject(self):
+        self._seed()
+        rows = db.get_all_cases(search="แจ้งปัญหา")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("แจ้งปัญหา", rows[0]["subject"])
+
+    def test_search_matches_customer_name(self):
+        self._seed()
+        rows = db.get_all_cases(search="ธนวัฒน์")
+        self.assertEqual(len(rows), 3)  # 3 cases owned by ธนวัฒน์
+
+    def test_search_matches_phone(self):
+        self._seed()
+        rows = db.get_all_cases(search="0800000001")
+        self.assertEqual(len(rows), 3)  # 3 cases owned by 0800000001
+
+    def test_limit_offset_paginates(self):
+        self._seed()
+        page1 = db.get_all_cases(limit=2, offset=0)
+        page2 = db.get_all_cases(limit=2, offset=2)
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        self.assertNotEqual(page1[0]["id"], page2[0]["id"])
+
+    def test_combined_status_and_search(self):
+        self._seed()
+        rows = db.get_all_cases(status="open", search="ที่นอน")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "open")
+        self.assertIn("ที่นอน", rows[0]["subject"])
+
+    def test_count_cases_unfiltered(self):
+        self._seed()
+        self.assertEqual(db.count_cases(), 6)
+
+    def test_count_cases_with_status(self):
+        self._seed()
+        self.assertEqual(db.count_cases(status="open"), 3)
+        self.assertEqual(db.count_cases(status="closed"), 1)
+
+    def test_count_cases_with_search(self):
+        self._seed()
+        self.assertEqual(db.count_cases(search="สุภาพร"), 3)
 
 
 class TestOrphanCaseCleanup(DBTestCase):
@@ -281,6 +485,227 @@ class TestRecoverStaleProcessing(DBTestCase):
 
         self.assertEqual(recovered, 0)
         self.assertEqual(row["status"], "processing")
+
+
+class TestUsers(DBTestCase):
+    def _make(self, username="somchai.p", role="Agent", active=True):
+        return db.create_user(username, "สมชาย", role, "hash-" + username, is_active=active)
+
+    def test_username_is_unique_case_insensitively(self):
+        self._make("somchai.p")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._make("SOMCHAI.P")
+
+    def test_get_user_by_username_ignores_case(self):
+        user_id = self._make("somchai.p")
+
+        self.assertEqual(db.get_user_by_username("SomChai.P")["id"], user_id)
+        self.assertIsNone(db.get_user_by_username("nobody"))
+
+    def test_update_user_patches_only_given_fields(self):
+        user_id = self._make("somchai.p", role="Agent")
+
+        db.update_user(user_id, role="QA")
+        row = db.get_user_by_id(user_id)
+
+        self.assertEqual(row["role"], "QA")
+        self.assertEqual(row["display_name"], "สมชาย")
+        self.assertEqual(row["is_active"], 1)
+
+    def test_count_active_admins_skips_disabled_and_excluded(self):
+        first = self._make("admin.one", role="Admin")
+        self._make("admin.two", role="Admin", active=False)
+        self._make("agent.one", role="Agent")
+
+        self.assertEqual(db.count_active_admins(), 1)
+        self.assertEqual(db.count_active_admins(exclude_user_id=first), 0)
+
+    def test_delete_user_removes_the_row(self):
+        user_id = self._make("somchai.p")
+
+        self.assertEqual(db.delete_user(user_id), 1)
+        self.assertIsNone(db.get_user_by_id(user_id))
+        self.assertEqual(db.count_users(), 0)
+
+
+class TestCustomerAndWarrantyEditing(DBTestCase):
+    """Edit / delete paths behind the Admin data-entry page."""
+
+    def _customer(self, phone="0812345600"):
+        return db.insert_customer(first_name="มาลี", last_name="ดอกไม้", phone=phone)
+
+    def _warranty(self, customer_id, registration_no="W001OZ25001"):
+        return db.insert_warranty(
+            registration_no=registration_no,
+            customer_id=customer_id,
+            brand="Omazz",
+            model="Natura Latex",
+            date_of_purchase="2024-06-15",
+            expiry_date="2034-06-15",
+        )
+
+    def test_update_customer_patches_only_editable_columns(self):
+        customer_id = self._customer()
+        original = db.get_customer_by_id(customer_id)
+
+        updated = db.update_customer(
+            customer_id,
+            first_name="มาลี",
+            last_name="ทองดี",
+            phone="0899999999",
+            id=999,               # ignored — not editable
+            created_at="1999-01-01",  # ignored — not editable
+        )
+        row = db.get_customer_by_id(customer_id)
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(row["last_name"], "ทองดี")
+        self.assertEqual(row["phone"], "0899999999")
+        self.assertEqual(row["id"], customer_id)
+        self.assertEqual(row["created_at"], original["created_at"])
+
+    def test_update_customer_ignores_an_unknown_row(self):
+        self.assertEqual(db.update_customer(999, first_name="ไม่มี"), 0)
+
+    def test_update_warranty_can_move_it_to_another_customer(self):
+        first = self._customer()
+        second = db.insert_customer(first_name="สมชาย", last_name="ใจดี", phone="0812345601")
+        warranty_id = self._warranty(first)
+
+        db.update_warranty(warranty_id, customer_id=second, size="6ft")
+        row = db.get_warranty_by_id(warranty_id)
+
+        self.assertEqual(row["customer_id"], second)
+        self.assertEqual(row["size"], "6ft")
+
+    def test_soft_delete_warranty_hides_the_row_but_keeps_it(self):
+        customer_id = self._customer()
+        warranty_id = self._warranty(customer_id)
+        call_id = db.insert_call("c.wav", "hash-1", "data/raw_audio/c.wav")
+        db.link_call_customer(call_id, customer_id, warranty_id)
+
+        self.assertEqual(db.soft_delete_warranty(warranty_id, actor="admin"), 1)
+
+        self.assertIsNone(db.get_warranty_by_id(warranty_id))
+        hidden = db.get_warranty_by_id(warranty_id, include_deleted=True)
+        self.assertIsNotNone(hidden)                 # the row is still there…
+        self.assertEqual(hidden["deleted_by"], "admin")
+        self.assertEqual(db.get_all_warranties(), [])
+        self.assertEqual(len(db.get_deleted_warranties()), 1)
+        # …and the call link is untouched, so history still resolves.
+        self.assertEqual(db.get_call_customer_link(call_id)["warranty_id"], warranty_id)
+
+        self.assertEqual(db.restore_warranty(warranty_id), 1)
+        self.assertIsNotNone(db.get_warranty_by_id(warranty_id))
+
+    def test_soft_delete_warranty_is_idempotent(self):
+        warranty_id = self._warranty(self._customer())
+
+        self.assertEqual(db.soft_delete_warranty(warranty_id), 1)
+        self.assertEqual(db.soft_delete_warranty(warranty_id), 0)
+
+    def test_soft_delete_customer_hides_customer_and_warranties_only(self):
+        customer_id = self._customer()
+        self._warranty(customer_id)
+        call_id = db.insert_call("c.wav", "hash-2", "data/raw_audio/c.wav")
+        db.link_call_customer(call_id, customer_id)
+        case_id = db.create_case(customer_id, "ผ้าขาด")
+        db.assign_call_to_case(call_id, case_id)
+
+        result = db.soft_delete_customer(customer_id, actor="admin")
+
+        self.assertEqual((result["customer"], result["warranties"]), (1, 1))
+        self.assertIsNone(db.get_customer_by_id(customer_id))
+        self.assertEqual(db.get_all_customers(), [])
+        self.assertEqual(db.get_warranties_by_customer(customer_id), [])
+
+        # Nothing was removed: the rows and everything attached still exist.
+        hidden = db.get_customer_by_id(customer_id, include_deleted=True)
+        self.assertEqual(hidden["deleted_by"], "admin")
+        self.assertEqual(len(db.get_warranties_by_customer(customer_id, include_deleted=True)), 1)
+        self.assertIsNotNone(db.get_call_customer_link(call_id))
+        self.assertIsNotNone(db.get_case_by_id(case_id))
+        call = db.get_call_by_id(call_id)
+        self.assertEqual(call["case_id"], case_id)
+
+    def test_restore_customer_brings_back_the_warranties_hidden_with_it(self):
+        customer_id = self._customer()
+        kept_hidden = self._warranty(customer_id, "W002OZ25002")
+        db.soft_delete_warranty(kept_hidden)      # hidden on its own, earlier
+        with_customer = self._warranty(customer_id, "W003OZ25003")
+        db.soft_delete_customer(customer_id)
+
+        result = db.restore_customer(customer_id)
+
+        self.assertEqual((result["customer"], result["warranties"]), (1, 1))
+        self.assertIsNotNone(db.get_customer_by_id(customer_id))
+        self.assertIsNotNone(db.get_warranty_by_id(with_customer))
+        # The one hidden separately stays hidden — restoring is not a blanket undo.
+        self.assertIsNone(db.get_warranty_by_id(kept_hidden))
+
+    def test_a_hidden_phone_is_still_taken_because_the_column_is_unique(self):
+        customer_id = self._customer(phone="0812345600")
+        db.soft_delete_customer(customer_id)
+
+        self.assertIsNone(db.get_customer_by_phone("0812345600"))
+        self.assertIsNotNone(db.get_customer_by_phone("0812345600", include_deleted=True))
+        # insert_customer stays idempotent instead of hitting the UNIQUE constraint
+        self.assertEqual(
+            db.insert_customer(first_name="ใคร", last_name="ก็ตาม", phone="0812345600"),
+            customer_id,
+        )
+
+    def test_count_customer_dependencies_reports_each_kind(self):
+        customer_id = self._customer()
+        self._warranty(customer_id)
+        call_id = db.insert_call("c.wav", "hash-3", "data/raw_audio/c.wav")
+        db.link_call_customer(call_id, customer_id)
+        db.create_case(customer_id, "ผ้าขาด")
+
+        self.assertEqual(
+            db.count_customer_dependencies(customer_id),
+            {"warranties": 1, "calls": 1, "cases": 1},
+        )
+
+
+class TestAuditLog(DBTestCase):
+    def test_log_action_stores_actor_and_changes(self):
+        entry_id = db.log_action(
+            action="update",
+            entity="customer",
+            entity_id=7,
+            entity_label="มาลี ดอกไม้",
+            actor="admin",
+            actor_role="Admin",
+            changes={"phone": ["0812345600", "0899999999"]},
+        )
+
+        entries = db.get_audit_log()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["id"], entry_id)
+        self.assertEqual(entry["actor"], "admin")
+        self.assertEqual(entry["entity_label"], "มาลี ดอกไม้")
+        self.assertEqual(entry["changes"], {"phone": ["0812345600", "0899999999"]})
+
+    def test_get_audit_log_filters_and_orders_newest_first(self):
+        db.log_action("create", "customer", 1, "ก")
+        db.log_action("create", "warranty", 2, "W001")
+        db.log_action("update", "customer", 1, "ก")
+
+        customer_entries = db.get_audit_log(entity="customer")
+        self.assertEqual([e["action"] for e in customer_entries], ["update", "create"])
+        self.assertEqual(len(db.get_audit_log(entity="warranty")), 1)
+        self.assertEqual(len(db.get_audit_log(entity="customer", entity_id=1)), 2)
+        self.assertEqual(db.count_audit_entries(), 3)
+        self.assertEqual(db.count_audit_entries(entity="warranty"), 1)
+
+    def test_audit_log_survives_hiding_the_row_it_describes(self):
+        customer_id = db.insert_customer(first_name="มาลี", last_name="ดอกไม้", phone="0812345600")
+        db.log_action("create", "customer", customer_id, "มาลี ดอกไม้", actor="admin")
+        db.soft_delete_customer(customer_id, actor="admin")
+
+        self.assertEqual(len(db.get_audit_log(entity="customer", entity_id=customer_id)), 1)
 
 
 if __name__ == "__main__":

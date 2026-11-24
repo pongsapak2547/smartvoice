@@ -35,42 +35,47 @@ def main() -> int:
     args = parser.parse_args()
 
     conn = db.get_connection()
-    rows = conn.execute(
-        "SELECT id, filename, transcript, agent_performance "
-        "FROM calls WHERE status = 'done' AND agent_performance IS NOT NULL"
-    ).fetchall()
+    updates = []
+    try:
+        rows = conn.execute(
+            "SELECT id, filename, transcript, agent_performance "
+            "FROM calls WHERE status = 'done' AND agent_performance IS NOT NULL"
+        ).fetchall()
 
-    changed = 0
-    for row in rows:
-        try:
-            ap = json.loads(row["agent_performance"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        old_action = ap.get("next_action") or ""
-        if not old_action:
-            continue
-        new_action = _scrub_prompt_example_leakage(old_action, row["transcript"] or "")
-        if new_action == old_action:
-            continue
-        changed += 1
-        print(f"[{row['id']}] {row['filename']}")
-        print(f"  OLD: {old_action}")
-        print(f"  NEW: {new_action}")
-        print()
+        changed = 0
+        for row in rows:
+            try:
+                ap = json.loads(row["agent_performance"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            old_action = ap.get("next_action") or ""
+            if not old_action:
+                continue
+            new_action = _scrub_prompt_example_leakage(old_action, row["transcript"] or "")
+            if new_action == old_action:
+                continue
+            changed += 1
+            print(f"[{row['id']}] {row['filename']}")
+            print(f"  OLD: {old_action}")
+            print(f"  NEW: {new_action}")
+            print()
+            if args.apply:
+                ap["next_action"] = new_action
+                updates.append((
+                    "UPDATE calls SET agent_performance = ? WHERE id = ?",
+                    (json.dumps(ap, ensure_ascii=False), row["id"]),
+                ))
+
         if args.apply:
-            ap["next_action"] = new_action
-            conn.execute(
-                "UPDATE calls SET agent_performance = ? WHERE id = ?",
-                (json.dumps(ap, ensure_ascii=False), row["id"]),
-            )
+            with conn:
+                for query, parameters in updates:
+                    conn.execute(query, parameters)
+            print(f"Updated {changed} row(s).")
+        else:
+            print(f"Dry-run: {changed} row(s) would be updated. Re-run with --apply to persist.")
 
-    if args.apply:
-        conn.commit()
-        print(f"Updated {changed} row(s).")
-    else:
-        print(f"Dry-run: {changed} row(s) would be updated. Re-run with --apply to persist.")
-
-    conn.close()
+    finally:
+        conn.close()
     return 0
 
 

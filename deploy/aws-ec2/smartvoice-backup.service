@@ -1,0 +1,19 @@
+[Unit]
+Description=SmartVoice database snapshot and S3 backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=smartvoice
+Group=smartvoice
+Environment=HOME=/var/lib/smartvoice
+# S3_BUCKET / S3_PREFIX (optional). Missing file = local snapshots only.
+EnvironmentFile=-/etc/smartvoice/backup.env
+ExecStart=/opt/smartvoice/app/deploy/aws-ec2/backup.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/smartvoice/app/data /var/lib/smartvoice
+UMask=0077

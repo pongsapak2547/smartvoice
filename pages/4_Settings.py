@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-st.set_page_config(page_title="SmartVoice - Settings", page_icon="⚙️", layout="wide")
+st.set_page_config(page_title="SmartVoice — ตั้งค่าระบบ", layout="wide")
 
 from smartvoice.env_settings import (
     DEMO_PRESET,
@@ -12,183 +12,166 @@ from smartvoice.env_settings import (
     read_env,
     write_env,
 )
+from smartvoice import audit as audit_trail
+from smartvoice import discord_notify
+from smartvoice.auth import PAGE_SETTINGS
 from smartvoice.preflight import run_preflight_checks
-from smartvoice.ui_helpers import get_current_user, init_page
+from smartvoice.ui_helpers import audit, init_page
 
-init_page()
+# Admin/Supervisor only (see smartvoice.auth.ROLE_PERMISSIONS).
+current_user, current_role = init_page(PAGE_SETTINGS)
 
-st.title("⚙️ Settings")
-st.caption("ปรับโหมด demo และ AI ได้จากหน้านี้ โดยไม่ต้องเปิดไฟล์ `.env` เอง")
+st.title("ตั้งค่าระบบ")
+st.caption(
+    "ปรับโหมดการทำงานของ AI และการแจ้งเตือน Discord ได้จากหน้านี้ โดยไม่ต้องแก้ไฟล์ `.env` เอง "
+    "— ค่าส่วนใหญ่มีผลหลังเปิดโปรแกรมใหม่ (ปิดแล้วเปิด run.bat อีกครั้ง)"
+)
 
-current_user, current_role = get_current_user()
-if not current_user:
-    st.warning("กรุณา login ที่ sidebar ก่อนปรับ settings")
-    st.stop()
 
-if current_role not in {"Admin", "Supervisor"}:
-    st.error("เฉพาะ Admin หรือ Supervisor เท่านั้นที่ปรับ settings ได้")
-    st.stop()
+@st.cache_data(ttl=300, show_spinner="กำลังตรวจความพร้อมของระบบ...")
+def _cached_preflight_checks():
+    return run_preflight_checks()
 
 values = read_env()
-
-# Whisper model → recommended Backend/Device/Compute (single source of truth).
-# Editing this table is enough — auto-match below picks it up.
-_WHISPER_MODELS = [
-    "biodatlab/distill-whisper-th-large-v3",
-    "large-v3",
-    "large-v3-turbo",
-]
-_WHISPER_BACKENDS = ["auto", "transformers", "faster-whisper"]
-_WHISPER_DEVICES = ["auto", "cpu", "cuda"]
-_WHISPER_COMPUTES = ["auto", "float16", "int8"]
-
-_WHISPER_RECOMMENDATIONS = {
-    "biodatlab/distill-whisper-th-large-v3": {
-        "backend": "transformers", "device": "cuda", "compute": "float16",
-        "note": "HF transformers model ภาษาไทย — เหมาะกับ NVIDIA GPU (fp16); ถ้าไม่มี GPU ให้ตั้ง Device = cpu",
-    },
-    "large-v3": {
-        "backend": "faster-whisper", "device": "cuda", "compute": "float16",
-        "note": "CT2 native — ต้องการ NVIDIA GPU + CUDA + cuDNN; CPU mode ใช้ Compute = int8",
-    },
-    "large-v3-turbo": {
-        "backend": "faster-whisper", "device": "cuda", "compute": "float16",
-        "note": "Turbo variant — เร็วกว่า large-v3 ~2x บน GPU เดียวกัน",
-    },
-}
-
-
-def _safe(saved, allowed, fallback):
-    return saved if saved in allowed else fallback
-
-
-# Initialize session_state once from .env so the form below shows saved values.
-if "whisper_model_pick" not in st.session_state:
-    st.session_state["whisper_model_pick"] = _safe(
-        values.get("WHISPER_MODEL", _WHISPER_MODELS[0]), _WHISPER_MODELS, _WHISPER_MODELS[0],
-    )
-if "whisper_backend_pick" not in st.session_state:
-    st.session_state["whisper_backend_pick"] = _safe(
-        values.get("WHISPER_BACKEND", "transformers"), _WHISPER_BACKENDS, "transformers",
-    )
-if "whisper_device_pick" not in st.session_state:
-    st.session_state["whisper_device_pick"] = _safe(
-        values.get("WHISPER_DEVICE", "auto"), _WHISPER_DEVICES, "auto",
-    )
-if "whisper_compute_pick" not in st.session_state:
-    st.session_state["whisper_compute_pick"] = _safe(
-        values.get("WHISPER_COMPUTE", "auto"), _WHISPER_COMPUTES, "auto",
-    )
-
-
-def _apply_whisper_recommendation():
-    """Auto-match Backend/Device/Compute when user picks a new Whisper model.
-
-    Runs as on_change callback BEFORE the dependent selectboxes re-render,
-    so it's legal to mutate their session_state keys.
-    """
-    rec = _WHISPER_RECOMMENDATIONS.get(st.session_state.get("whisper_model_pick", ""))
-    if not rec:
-        return
-    st.session_state["whisper_backend_pick"] = rec["backend"]
-    st.session_state["whisper_device_pick"] = rec["device"]
-    st.session_state["whisper_compute_pick"] = rec["compute"]
-
 
 mode_col, status_col = st.columns([1.2, 1])
 
 with mode_col:
-    st.subheader("Quick Mode")
-    st.write("เลือก preset แล้วกด Apply เพื่อบันทึกลง `.env`")
+    st.subheader("เลือกโหมดด่วน")
+    st.write("กดปุ่มเดียวเพื่อตั้งค่าทั้งชุด")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Use Demo Laptop Mode", use_container_width=True):
+        if st.button("โหมดสาธิต (ใช้บทสนทนาตัวอย่าง)", use_container_width=True,
+                     help="ใช้บทสนทนาตัวอย่างแทนการถอดเสียงจริง — เหมาะกับโน้ตบุ๊กหรือการนำเสนอ"):
             write_env(DEMO_PRESET)
-            st.success("Saved demo mode. Restart the app to apply all settings.")
+            audit(
+                audit_trail.UPDATE, audit_trail.ENTITY_SETTINGS,
+                entity_label="Demo Laptop Mode", changes=dict(DEMO_PRESET),
+            )
+            st.success("บันทึกโหมดสาธิตแล้ว — ปิดและเปิดโปรแกรมใหม่เพื่อให้มีผล")
             st.rerun()
     with c2:
-        if st.button("Use Real AI Mode", use_container_width=True):
+        if st.button("โหมดใช้งานจริง (AI เต็มรูปแบบ)", use_container_width=True,
+                     help="ถอดเสียงและแยกผู้พูดด้วย pyannoteAI และวิเคราะห์ด้วย Typhoon API"):
             write_env(REAL_AI_PRESET)
-            st.success("Saved real AI mode. Add HF token if needed, then restart.")
+            audit(
+                audit_trail.UPDATE, audit_trail.ENTITY_SETTINGS,
+                entity_label="Real AI Mode", changes=dict(REAL_AI_PRESET),
+            )
+            st.success("บันทึกโหมด API แล้ว — ตั้งค่า API keys แล้วเปิดโปรแกรมใหม่")
             st.rerun()
 
 with status_col:
-    st.subheader("Current Mode")
+    st.subheader("โหมดปัจจุบัน")
     is_demo = env_bool(values, "MOCK_STT", default=False)
-    st.metric("STT", "Demo / Mock" if is_demo else "Real AI")
-    token = values.get("HF_TOKEN", "")
-    st.caption(f"HF token: `{mask_secret(token) or 'not set'}`")
+    st.metric("การถอดเสียง", "โหมดสาธิต" if is_demo else "ใช้งานจริง")
+    st.caption("ถอดเสียง: pyannoteAI API | วิเคราะห์: Typhoon API")
 
 st.divider()
 
-st.subheader("Demo & AI Settings")
+st.subheader("ตั้งค่าโดยละเอียด")
 
-# Not wrapped in st.form: forms batch widget updates until submit, which
-# would block the Whisper-model → Backend/Device/Compute auto-match from
-# running live. Regular widgets + an explicit Save button preserve that UX.
 demo_mode = st.toggle(
-    "Demo mode (skip real STT and use mock transcripts)",
+    "โหมดสาธิต (ไม่ถอดเสียงจริง ใช้บทสนทนาตัวอย่าง)",
     value=env_bool(values, "MOCK_STT", default=False),
 )
 
-st.markdown("#### Real AI")
-hf_token = st.text_input(
-    "HuggingFace token",
+st.markdown("#### AI สำหรับการใช้งานจริง")
+stt_provider = "pyannote_api"
+llm_provider = "typhoon"
+st.caption("บริการถอดเสียงและแยกผู้พูด: pyannoteAI API | บริการวิเคราะห์ข้อความ: Typhoon API")
+api_updates = {}
+if stt_provider == "pyannote_api" or llm_provider == "typhoon":
+    st.info("โหมด API ส่งเสียงหรือบทสนทนาให้ผู้ให้บริการภายนอก และมีค่าใช้บริการตามบัญชีของคุณ")
+    st.caption("ตั้งค่า key แล้วต้องเปิดโปรแกรมใหม่ การตรวจความพร้อมตรวจเพียงว่ามี key ยังไม่ยืนยันสิทธิ์หรือเครดิต")
+if stt_provider == "pyannote_api":
+    st.caption("ถอดเสียงด้วย Whisper Large v3 Turbo พร้อมแยกผู้พูด ไม่ต้องติดตั้งโมเดลหรือ GPU")
+    api_updates["STT_API_MODEL"] = "faster-whisper-large-v3-turbo"
+    api_updates["PYANNOTE_API_MODEL"] = st.selectbox(
+        "รุ่น Pyannote API", ["precision-2", "precision-3"],
+        index=1 if values.get("PYANNOTE_API_MODEL") == "precision-3" else 0,
+        key="_pyannote_api_model",
+    )
+if llm_provider == "typhoon":
+    api_updates["TYPHOON_MODEL"] = st.text_input(
+        "รุ่น Typhoon API", value=values.get("TYPHOON_MODEL", "typhoon-v2.5-30b-a3b-instruct"),
+        help="เปลี่ยนเป็น typhoon-v2.1-12b-instruct เพื่อทดลองรุ่นเล็กลงได้ตามสิทธิ์ของบัญชี",
+        key="_typhoon_api_model",
+    ).strip()
+for field, enabled in (("PYANNOTE_API_KEY", stt_provider == "pyannote_api"), ("TYPHOON_API_KEY", llm_provider == "typhoon")):
+    if enabled:
+        st.caption(f"{field}: {'ตั้งค่าไว้แล้ว' if values.get(field) else 'ยังไม่ได้ตั้งค่า'}")
+        secret = st.text_input(field, type="password", placeholder="เว้นว่างเพื่อใช้ค่าเดิม", key=f"_api_secret_{field}")
+        clear = st.checkbox(f"ลบ {field} ที่บันทึกไว้", key=f"_api_clear_{field}")
+        if clear:
+            api_updates[field] = ""
+        elif secret.strip():
+            api_updates[field] = secret.strip()
+st.markdown("#### แจ้งเตือน Discord")
+st.caption(
+    "ส่งข้อความเข้าช่อง Discord ทุกครั้งที่มีคนรับเคส คืนเคส ปิดเคส หรือเปิดเคสอีกครั้ง — "
+    "สร้าง webhook ได้ที่ Discord: ตั้งค่าช่อง → Integrations → Webhooks → New Webhook → Copy Webhook URL"
+)
+_saved_webhook = values.get(discord_notify.ENV_KEY, "")
+st.caption(f"Webhook ปัจจุบัน: `{mask_secret(_saved_webhook) or 'ยังไม่ได้ตั้งค่า (ไม่ส่งแจ้งเตือน)'}`")
+discord_webhook = st.text_input(
+    "Discord webhook URL",
     value="",
     type="password",
-    placeholder="Leave blank to keep current token",
-    help="Required for pyannote speaker diarization in real AI mode.",
+    placeholder="เว้นว่างไว้ = ใช้ค่าเดิม",
+    help="URL นี้เป็นความลับ — ใครมี URL ก็โพสต์เข้าช่องได้ ระบบจึงไม่แสดงเต็มและไม่บันทึกลง Audit log",
+    key="_discord_webhook_input",
 )
-clear_hf_token = st.checkbox("Clear saved HuggingFace token")
-
-ollama_base_url = st.text_input(
-    "Ollama base URL",
-    value=values.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-)
-ollama_model = st.text_input(
-    "Ollama model",
-    value=values.get("OLLAMA_MODEL", "scb10x/llama3.1-typhoon2-8b-instruct"),
-)
-
-st.markdown("#### Speech model")
-whisper_model = st.selectbox(
-    "Whisper model", _WHISPER_MODELS,
-    key="whisper_model_pick", on_change=_apply_whisper_recommendation,
-)
-_rec = _WHISPER_RECOMMENDATIONS.get(whisper_model, {})
-if _rec:
-    st.caption(
-        f"💡 แนะนำสำหรับโมเดลนี้: Backend = `{_rec['backend']}`, "
-        f"Device = `{_rec['device']}`, Compute = `{_rec['compute']}` — {_rec['note']}"
+clear_discord_webhook = st.checkbox("ปิดการแจ้งเตือน Discord (ลบ webhook ที่บันทึกไว้)")
+if st.button("ส่งข้อความทดสอบ", key="_discord_test_btn",
+             help="ใช้ URL ที่พิมพ์ไว้ด้านบน ถ้าเว้นว่างจะใช้ค่าที่บันทึกไว้"):
+    _ok, _detail = discord_notify.post(
+        discord_notify.build_test_payload(current_user),
+        url=discord_webhook.strip() or None,
     )
-whisper_backend = st.selectbox("Backend", _WHISPER_BACKENDS, key="whisper_backend_pick")
-whisper_device = st.selectbox("Device", _WHISPER_DEVICES, key="whisper_device_pick")
-whisper_compute = st.selectbox("Compute", _WHISPER_COMPUTES, key="whisper_compute_pick")
+    (st.success if _ok else st.error)(_detail)
 
-submitted = st.button("Save Settings", use_container_width=True, type="primary")
+submitted = st.button("บันทึกการตั้งค่า", use_container_width=True, type="primary")
 
 if submitted:
     updates = {
+        "STT_PROVIDER": stt_provider,
+        "LLM_PROVIDER": llm_provider,
+        **api_updates,
         "MOCK_STT": "true" if demo_mode else "false",
-        "OLLAMA_BASE_URL": ollama_base_url.strip() or "http://localhost:11434",
-        "OLLAMA_MODEL": ollama_model.strip(),
-        "WHISPER_MODEL": whisper_model,
-        "WHISPER_BACKEND": whisper_backend,
-        "WHISPER_DEVICE": whisper_device,
-        "WHISPER_COMPUTE": whisper_compute,
     }
-    if clear_hf_token:
-        updates["HF_TOKEN"] = ""
-    elif hf_token.strip():
-        updates["HF_TOKEN"] = hf_token.strip()
 
+    webhook_error = None
+    if clear_discord_webhook:
+        updates[discord_notify.ENV_KEY] = ""
+    elif discord_webhook.strip():
+        if discord_notify.is_valid_webhook_url(discord_webhook):
+            updates[discord_notify.ENV_KEY] = discord_webhook.strip()
+        else:
+            webhook_error = (
+                "ไม่ได้บันทึก Discord webhook — URL ต้องขึ้นต้นด้วย "
+                "`https://discord.com/api/webhooks/` (ค่าอื่นบันทึกแล้วตามปกติ)"
+            )
+
+    # HF_TOKEN / DISCORD_WEBHOOK_URL are redacted by smartvoice.audit before they reach the log.
+    changed = audit_trail.diff_fields(values, updates)
     write_env(updates)
-    st.success("Saved to `.env`. Restart the app with `run.bat` so every module uses the new settings.")
+    if changed:
+        audit(
+            audit_trail.UPDATE, audit_trail.ENTITY_SETTINGS,
+            entity_label="Save Settings", changes=changed,
+        )
+    st.success("บันทึกแล้ว — ปิดและเปิดโปรแกรมใหม่เพื่อให้ค่าใหม่มีผลทุกส่วน (โหมด API: python -m streamlit run Home.py)")
+    if webhook_error:
+        st.error(webhook_error)
+
 
 st.divider()
 
-st.subheader("Readiness Checks")
-for check in run_preflight_checks():
+st.subheader("ตรวจความพร้อมของระบบ")
+if st.button("ตรวจสอบใหม่", key="_settings_recheck"):
+    _cached_preflight_checks.clear()
+for check in _cached_preflight_checks():
     if check.ok:
         st.success(f"{check.name}: {check.detail}")
     elif check.severity == "error":
